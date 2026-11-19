@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: keitaro
+      POSTGRES_PASSWORD: keitaro
+      POSTGRES_DB: keitaro_wrapper
+    ports:
+      # 5433 на хосте: 5432 обычно занят локальным Postgres разработчика
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keitaro -d keitaro_wrapper"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      # внутри compose-сети БД доступна по имени сервиса и стандартному порту
+      DATABASE_URL: postgresql+asyncpg://keitaro:keitaro@db:5432/keitaro_wrapper
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,39 @@
+# Секреты и локальные артефакты
+.env
+.env.*
+!.env.example
+План_ETOLEGKO_Keitaro.md
+EtoLegkoFinal.txt
+trebovaniya.md
+
+# Локальные настройки агентов и IDE (в публичный репозиторий не нужны)
+.clinerules
+.idea/
+.vscode/
+
+# Локальные файлы БД (тесты используют память и временные каталоги)
+*.db
+*.sqlite3
+
+# Выгрузки Keitaro и скачанные спецификации
+/data/
+/docs/
+/scripts/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Сборка
+dist/
+build/
+*.egg-info/
+
+# macOS
+.DS_Store
