@@ -13,7 +13,7 @@ from keitaro_wrapper.db import OperationLog, OperationStatus
 from keitaro_wrapper.db.directories import DirectoryEntry, replace_directory
 from keitaro_wrapper.db.models import OperationType
 from keitaro_wrapper.db.operations import claim_operation, find_operation
-from keitaro_wrapper.keitaro import Domain, KeitaroUnavailable, Offer
+from keitaro_wrapper.keitaro import Domain, Group, KeitaroUnavailable, Offer, TrafficSource
 from keitaro_wrapper.services.campaigns import (
     CampaignRequest,
     build_campaign,
@@ -193,6 +193,30 @@ async def test_create_campaign_creates_two_streams(
     assert [stream["schema"] for stream in stored.result["streams"]] == ["redirect", "landings"]
 
 
+async def test_create_campaign_uses_selected_directory_ids(
+    session: AsyncSession,
+    stub: StubKeitaro,
+    settings: Settings,
+) -> None:
+    """UI выбирает домен/группу/источник: сервис берёт их, а не значения `.env`."""
+    stub.domains.append(Domain(id=2000, name="second.example"))
+    stub.groups.append(Group(id=2001, name="Second group", type="campaigns"))
+    stub.traffic_sources.append(TrafficSource(id=2002, name="Second source"))
+    payload = CampaignRequest(
+        name="Selected IDs",
+        geo="MX",
+        offer_id=18813,
+        domain_id=2000,
+        group_id=2001,
+        traffic_source_id=2002,
+    )
+
+    await create_campaign(session, stub, settings, payload)
+
+    sent = next(item for name, item in stub.calls if name == "create_campaign")
+    assert (sent.domain_id, sent.group_id, sent.traffic_source_id) == (2000, 2001, 2002)
+
+
 async def test_cached_directories_avoid_keitaro_calls(
     session: AsyncSession,
     stub: StubKeitaro,
@@ -315,7 +339,7 @@ async def test_pending_operation_conflicts(
         session,
         idempotency_key="key-busy",
         operation_type=OperationType.CAMPAIGN_CREATE,
-        payload=request_payload.model_dump(mode="json"),
+        payload=request_payload.model_dump(mode="json", exclude_none=True),
     )
     await session.commit()
 

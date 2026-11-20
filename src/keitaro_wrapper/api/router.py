@@ -2,8 +2,10 @@
 
 from fastapi import APIRouter
 
-from keitaro_wrapper.api.routes import campaigns, health
+from keitaro_wrapper.api.routes import campaigns, health, ui
 
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(campaigns.router)
+api_router.include_router(ui.root_router)
+api_router.include_router(ui.router)

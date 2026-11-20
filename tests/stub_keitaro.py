@@ -158,9 +158,13 @@ class StubKeitaro:
             raise KeitaroValidationError(
                 "POST /campaigns -> HTTP 422: alias: Alias already exists", status=422
             )
+        if self.fail_stage == "campaign_name_taken":
+            raise KeitaroValidationError(
+                "POST /campaigns -> HTTP 422: name: Name has already used", status=422
+            )
         if self.fail_stage == "campaign_auth":
             raise KeitaroAuthError("POST /campaigns -> HTTP 403: Access denied", status=403)
-        return Campaign(
+        campaign = Campaign(
             id=CAMPAIGN_ID,
             name=payload.name,
             alias=payload.alias,
@@ -170,6 +174,10 @@ class StubKeitaro:
             group_id=payload.group_id,
             traffic_source_id=payload.traffic_source_id,
         )
+        # Как живой Keitaro: созданная кампания сразу появляется в списке
+        self.campaigns = [item for item in self.campaigns if item.id != campaign.id]
+        self.campaigns.append(campaign)
+        return campaign
 
     async def list_campaigns(self) -> list[Campaign]:
         self.calls.append(("list_campaigns", None))

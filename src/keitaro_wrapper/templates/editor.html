@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Редактор — Keitaro wrapper{% endblock %}
+{% block content %}
+<section class="page-head">
+  <h1>Редактор офферов</h1>
+  <p>Потоки кампании, веса офферов и цифры из отчёта Keitaro.</p>
+</section>
+
+<form class="card filters" method="get" action="/ui/editor">
+  <label>Кампания
+    <select name="campaign_id" {% if not campaigns %}disabled{% endif %}>
+      {% for campaign in campaigns %}
+        <option value="{{ campaign.id }}" {% if campaign.id == selected_campaign_id %}selected{% endif %}>
+          {{ campaign.name }} ({{ campaign.id }})
+        </option>
+      {% endfor %}
+      {% if not campaigns %}<option value="">— кампаний нет —</option>{% endif %}
+    </select>
+  </label>
+  <label>Период цифр
+    <select name="interval">
+      {% set intervals = [
+        ('all_time', 'За всё время'), ('today', 'Сегодня'), ('yesterday', 'Вчера'),
+        ('7_days_ago', '7 дней'), ('1_month_ago', 'Месяц'),
+        ('first_day_of_this_week', 'С начала недели'),
+        ('first_day_of_this_month', 'С начала месяца'),
+        ('1_year_ago', 'Год'), ('first_day_of_this_year', 'С начала года')
+      ] %}
+      {% for value, label in intervals %}
+        <option value="{{ value }}" {% if value == interval %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <button class="btn btn-primary" type="submit" {% if not campaigns %}disabled{% endif %}>Открыть</button>
+  {% if detail %}
+    <a class="btn" href="/ui/editor?campaign_id={{ detail.campaign_id }}&interval={{ interval }}&refresh=1">
+      Обновить кэш
+    </a>
+  {% endif %}
+  <a class="btn" href="/ui/creator">Создать кампанию</a>
+</form>
+
+{% if not campaigns and not detail and not error %}
+  <div class="card empty">
+    <strong>Кампаний пока нет</strong>
+    В кэше и в Keitaro не нашлось ни одной кампании.
+    <div style="margin-top:16px"><a class="btn btn-primary" href="/ui/creator">Создать первую</a></div>
+  </div>
+{% endif %}
+
+{% if detail %}
+  <div class="cards" style="margin-bottom:18px">
+    <div class="metric">
+      <div class="label">Кампания</div>
+      <div class="value small">{{ detail.name }}</div>
+    </div>
+    <div class="metric">
+      <div class="label">Alias</div>
+      <div class="value small"><code>{{ detail.alias }}</code></div>
+    </div>
+    <div class="metric">
+      <div class="label">Клики</div>
+      <div class="value">{{ detail.clicks }}</div>
+    </div>
+    <div class="metric">
+      <div class="label">Конверсии</div>
+      <div class="value">{{ detail.conversions }}</div>
+    </div>
+  </div>
+
+  {% if not detail.stats_available %}
+    <div class="alert alert-warn" role="status">
+      Цифры временно недоступны: отчёт Keitaro не ответил. Потоки и офферы можно
+      редактировать, веса пересчитаются как обычно.
+    </div>
+  {% endif %}
+  {% for stream in detail.streams %}
+    <section class="card">
+      <div class="stream-head">
+        <h2>{{ stream.name }}</h2>
+        <span class="badge">{{ stream.type }}</span>
+        {% if stream.schema_ %}<span class="badge muted">{{ stream.schema_ }}</span>{% endif %}
+        {% if stream.position %}<span class="badge muted">позиция {{ stream.position }}</span>{% endif %}
+        {% if stream.offers %}
+          {% set total = stream.offers | sum(attribute='share') %}
+          <span class="badge {% if total != 100 %}warn{% endif %}">Σ {{ total }}%</span>
+        {% endif %}
+      </div>
+
+      {% if stream.offers %}
+        <table>
+          <thead>
+            <tr>
+              <th>#</th><th>Оффер</th><th>Вес</th><th>Клики</th><th>Конверсии</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for offer in stream.offers %}
+              <tr>
+                <td class="num">{{ loop.index }}</td>
+                <td>
+                  <strong>{{ offer.name or 'оффер ' ~ offer.offer_id }}</strong><br>
+                  <span class="muted"><code>id {{ offer.offer_id }}</code>
+                    {% if offer.state and offer.state != 'active' %} · {{ offer.state }}{% endif %}
+                  </span>
+                </td>
+                <td><span class="weight">{{ offer.share }}%</span></td>
+                <td class="num">{{ offer.clicks }}</td>
+                <td class="num">{{ offer.conversions }}</td>
+                <td>
+                  <form method="post"
+                        action="/ui/editor/{{ detail.campaign_id }}/offers/{{ offer.offer_id }}/delete"
+                        onsubmit="return confirm('Удалить оффер из потока?')">
+                    <input type="hidden" name="idempotency_key" value="{{ delete_keys[(stream.id, offer.offer_id)] }}">
+                    <input type="hidden" name="stream_id" value="{{ stream.id }}">
+                    <input type="hidden" name="interval" value="{{ interval }}">
+                    <button class="btn btn-danger btn-small" type="submit">Удалить</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="muted">В этом потоке нет офферов: он либо ведёт на лендинги, либо редиректит.</p>
+      {% endif %}
+    </section>
+  {% endfor %}
+
+  {% if not detail.streams %}
+    <div class="card empty"><strong>У кампании нет потоков</strong>Проверьте её в Keitaro.</div>
+  {% endif %}
+
+  <section class="card">
+    <h2>Добавить оффер</h2>
+    {% if available_offers %}
+      <form class="inline" method="post" action="/ui/editor/{{ detail.campaign_id }}/offers" style="margin-top:12px">
+        <input type="hidden" name="idempotency_key" value="{{ add_key }}">
+        <input type="hidden" name="interval" value="{{ interval }}">
+        <select name="offer_id" required>
+          {% for offer in available_offers %}
+            <option value="{{ offer.id }}" {% if offer.state not in (none, 'active') %}disabled{% endif %}>
+              {{ offer.name }}{% if offer.state and offer.state != 'active' %} · {{ offer.state }}{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+        <button class="btn btn-primary" type="submit">Добавить</button>
+      </form>
+      <p class="hint" style="margin-top:10px">
+        После добавления веса всех офферов потока пересчитываются поровну и в сумме дают 100%.
+      </p>
+    {% else %}
+      <p class="muted" style="margin-top:10px">
+        Добавлять нечего: все офферы из справочника уже стоят в потоках этой кампании
+        или справочник пуст. Обновите кэш кнопкой выше.
+      </p>
+    {% endif %}
+  </section>
+{% endif %}
+{% endblock %}

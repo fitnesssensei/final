@@ -20,13 +20,12 @@ import re
 import secrets
 import string
 from collections.abc import Sequence
-from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from keitaro_wrapper.config import Settings
-from keitaro_wrapper.db.directories import entries_from_models, list_directory, replace_directory
+from keitaro_wrapper.db.directories import list_directory
 from keitaro_wrapper.db.models import DictionaryCache, OperationType
 from keitaro_wrapper.db.operations import claim_operation, mark_succeeded
 from keitaro_wrapper.keitaro import (
@@ -42,6 +41,7 @@ from keitaro_wrapper.keitaro import (
 from keitaro_wrapper.services.errors import RequestError, ServiceError
 from keitaro_wrapper.services.idempotency import make_key, record_failure, replay
 from keitaro_wrapper.services.offers import require_active_offer
+from keitaro_wrapper.services.reference import refresh_directory
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,11 @@ class CampaignRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     geo: str
     offer_id: int = Field(gt=0)
+    # Необязательные переопределения значений из `.env`: их выбирает UI,
+    # а API без них работает как раньше — берёт KEITARO_* из настроек.
+    domain_id: int | None = Field(default=None, gt=0)
+    group_id: int | None = Field(default=None, gt=0)
+    traffic_source_id: int | None = Field(default=None, gt=0)
 
     @field_validator("name")
     @classmethod
@@ -170,20 +175,6 @@ def build_offer_stream(campaign_id: int, offer_id: int) -> StreamCreate:
     )
 
 
-async def _refresh_directory(session: AsyncSession, client: KeitaroClient, kind: str) -> None:
-    """Читает справочник из Keitaro и полностью заменяет локальный кэш."""
-    if kind == "domains":
-        items: list[Any] = await client.list_domains()
-    elif kind == "groups":
-        # `type` обязателен, иначе живой инстанс отвечает 400
-        items = await client.list_groups("campaigns")
-    elif kind == "traffic_sources":
-        items = await client.list_traffic_sources()
-    else:
-        raise ValueError(f"неизвестный справочник: {kind!r}")
-    await replace_directory(session, kind=kind, entries=entries_from_models(items))
-
-
 def _find_entry(
     rows: Sequence[DictionaryCache], entity_id: int, kind: str
 ) -> DictionaryCache | None:
@@ -215,30 +206,32 @@ async def _require_entry(
     rows = await list_directory(session, kind)
     entry = _find_entry(rows, entity_id, kind)
     if entry is None:
-        await _refresh_directory(session, client, kind)
+        await refresh_directory(session, client, kind)
         entry = _find_entry(await list_directory(session, kind), entity_id, kind)
     if entry is None:
         raise RequestError(
-            f"{label} с id={entity_id} отсутствует в Keitaro — проверьте KEITARO_* в .env"
+            f"{label} с id={entity_id} отсутствует в Keitaro — "
+            "обновите кэш или проверьте id/KEITARO_* в .env"
         )
     return entry
 
 
 async def _validate_directories(
-    session: AsyncSession, client: KeitaroClient, settings: Settings
+    session: AsyncSession,
+    client: KeitaroClient,
+    *,
+    domain_id: int,
+    group_id: int,
+    traffic_source_id: int,
 ) -> None:
-    """Домен, группа и источник по умолчанию должны существовать в Keitaro."""
-    await _require_entry(
-        session, client, kind="domains", entity_id=settings.keitaro_domain_id, label="домен"
-    )
-    await _require_entry(
-        session, client, kind="groups", entity_id=settings.keitaro_group_id, label="группа"
-    )
+    """Домен, группа и источник (из UI или `.env`) должны существовать в Keitaro."""
+    await _require_entry(session, client, kind="domains", entity_id=domain_id, label="домен")
+    await _require_entry(session, client, kind="groups", entity_id=group_id, label="группа")
     await _require_entry(
         session,
         client,
         kind="traffic_sources",
-        entity_id=settings.keitaro_source_id,
+        entity_id=traffic_source_id,
         label="источник трафика",
     )
 
@@ -297,7 +290,7 @@ async def create_campaign(
     кампанию. Каждая точка отказа после создания кампании компенсируется.
     """
     key = make_key(idempotency_key)
-    payload = request.model_dump(mode="json")
+    payload = request.model_dump(mode="json", exclude_none=True)
     try:
         claim = await claim_operation(
             session,
@@ -321,8 +314,17 @@ async def create_campaign(
 
     campaign: Campaign | None = None
     campaign_ready = False
+    domain_id = request.domain_id or settings.keitaro_domain_id
+    group_id = request.group_id or settings.keitaro_group_id
+    traffic_source_id = request.traffic_source_id or settings.keitaro_source_id
     try:
-        await _validate_directories(session, client, settings)
+        await _validate_directories(
+            session,
+            client,
+            domain_id=domain_id,
+            group_id=group_id,
+            traffic_source_id=traffic_source_id,
+        )
         await require_active_offer(client, request.offer_id)
         # Отпускаем соединение с БД до сетевых вызовов: иначе транзакция,
         # открытая чтением справочников, держит его всё время создания потоков.
@@ -331,9 +333,9 @@ async def create_campaign(
             build_campaign(
                 alias=make_alias(request.name),
                 name=request.name,
-                domain_id=settings.keitaro_domain_id,
-                group_id=settings.keitaro_group_id,
-                traffic_source_id=settings.keitaro_source_id,
+                domain_id=domain_id,
+                group_id=group_id,
+                traffic_source_id=traffic_source_id,
             )
         )
         streams = await _create_streams(client, campaign, request, settings)

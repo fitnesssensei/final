@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -37,6 +38,11 @@ KEITARO_UNAVAILABLE = "Keitaro недоступен — повторите за�
 KEITARO_AUTH = "Keitaro отклонил ключ API — проверьте KEITARO_API_KEY и права ключа"
 KEITARO_UNEXPECTED = "Неожиданный ответ Keitaro — подробности в логе приложения"
 
+# Префикс, который клиент добавляет к любой ошибке трекера:
+# `POST /campaigns -> HTTP 422: <ответ>`. Метод, путь и код нужны логу, а
+# клиенту — только причина, поэтому в текст ответа они не попадают.
+_REQUEST_PREFIX = re.compile(r"^[A-Z]+ \S+ -> HTTP \d{3}: ")
+
 
 async def handle_database_not_ready(request: Request, exc: Exception) -> JSONResponse:
     """503 с подсказкой про миграции; SQL и параметры остаются в логе.
@@ -48,7 +54,7 @@ async def handle_database_not_ready(request: Request, exc: Exception) -> JSONRes
     return JSONResponse(status_code=503, content={"detail": DATABASE_NOT_READY})
 
 
-def _keitaro_status(exc: KeitaroError) -> int:
+def keitaro_status(exc: KeitaroError) -> int:
     """HTTP-статус для ошибки трекера.
 
     `KeitaroAuthError` — это 502, а не 401: ключ принадлежит сервису, клиент
@@ -63,17 +69,56 @@ def _keitaro_status(exc: KeitaroError) -> int:
     return 502
 
 
-def _keitaro_detail(exc: KeitaroError) -> str:
+def _tracker_reason(exc: KeitaroError) -> str:
+    """Ответ трекера без метода, пути и кода — то, что можно показать человеку."""
+    reason = _REQUEST_PREFIX.sub("", exc.message).strip()
+    return reason or "без текста"
+
+
+def _validation_reason(exc: KeitaroValidationError) -> str:
+    """422 от Keitaro: для частых случаев — подсказка, иначе поле и причина.
+
+    Keitaro отвечает по-английски и без локали: «name: Name has already used»
+    пользователю ничего не говорит, поэтому узнаваемые ответы переводим, а
+    остальные показываем как есть, но без внутреннего адреса запроса.
+    """
+    reason = _tracker_reason(exc)
+    lowered = reason.lower()
+    if "already" in lowered or "has used" in lowered:
+        if "alias" in lowered:
+            return "такой alias уже занят — отправьте форму ещё раз, alias генерируется заново"
+        if "name" in lowered:
+            return "такое название кампании уже занято — укажите другое"
+    return f"Keitaro отклонил данные: {reason}"
+
+
+def keitaro_detail(exc: KeitaroError) -> str:
     """Текст для клиента: без URL с query-параметрами и без тела ответа трекера."""
     if isinstance(exc, KeitaroAuthError):
         return KEITARO_AUTH
     if isinstance(exc, KeitaroUnavailable):
         return KEITARO_UNAVAILABLE
     if isinstance(exc, KeitaroNotFound):
-        return f"в Keitaro не найдено: {exc.message}"
+        return f"в Keitaro не найдено: {_tracker_reason(exc)}"
     if isinstance(exc, KeitaroValidationError):
-        return exc.message
+        return _validation_reason(exc)
     return KEITARO_UNEXPECTED
+
+
+def describe_user_error(exc: Exception) -> tuple[int, str] | None:
+    """Переводит известные ошибки в (статус, текст) для HTML-страниц UI.
+
+    JSON-ручки перехватывают те же классы глобальными обработчиками; UI ловит
+    их сам, чтобы вернуть страницу с сообщением, а не JSON. `None` означает
+    «ошибка неизвестна, пусть всплывает» — иначе мы бы скрыли баг.
+    """
+    if isinstance(exc, KeitaroError):
+        return keitaro_status(exc), keitaro_detail(exc)
+    if isinstance(exc, ServiceError):
+        return exc.status_code, str(exc)
+    if isinstance(exc, (OperationalError, ProgrammingError, PoolTimeoutError, ConnectionError)):
+        return 503, DATABASE_NOT_READY
+    return None
 
 
 async def handle_keitaro_error(request: Request, exc: Exception) -> JSONResponse:
@@ -84,7 +129,7 @@ async def handle_keitaro_error(request: Request, exc: Exception) -> JSONResponse
     """
     logger.warning("Keitaro (%s %s): %s", request.method, request.url.path, exc)
     assert isinstance(exc, KeitaroError)  # обработчик зарегистрирован на этот класс
-    return JSONResponse(status_code=_keitaro_status(exc), content={"detail": _keitaro_detail(exc)})
+    return JSONResponse(status_code=keitaro_status(exc), content={"detail": keitaro_detail(exc)})
 
 
 async def handle_service_error(request: Request, exc: Exception) -> JSONResponse:

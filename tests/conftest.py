@@ -1,7 +1,8 @@
 """Общие фикстуры тестов."""
 
+import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
 import httpx
@@ -66,7 +67,7 @@ def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_settings_cache() -> None:
+def _reset_settings_cache() -> AsyncIterator[None]:
     """Сбрасывает кэш `get_settings()` до и после теста.
 
     `get_settings` кэширован через `lru_cache`, а тесты меняют окружение:
@@ -76,3 +77,20 @@ def _reset_settings_cache() -> None:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _restore_loggers() -> Iterator[None]:
+    """Возвращает логгеры после тестов, которые запускают alembic.
+
+    `migrations/env.py` вызывает `fileConfig` от `alembic.ini`, а тот по
+    умолчанию глушит уже созданные логгеры (`disable_existing_loggers=True`):
+    после `test_migrations` логи приложения перестают доходить до обработчика
+    pytest, и `caplog` в следующих тестах остаётся пустым. Сбой зависел бы от
+    порядка файлов, поэтому чистим после каждого теста.
+    """
+    yield
+    logging.disable(logging.NOTSET)
+    for logger in logging.Logger.manager.loggerDict.values():
+        if isinstance(logger, logging.Logger):
+            logger.disabled = False

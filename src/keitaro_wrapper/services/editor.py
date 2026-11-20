@@ -376,15 +376,25 @@ async def _claim(
         raise RequestError(str(exc)) from exc
 
 
-async def _offer_stream(client: KeitaroClient, campaign_id: int) -> Stream:
+async def _offer_stream(
+    client: KeitaroClient, campaign_id: int, *, stream_id: int | None = None
+) -> Stream:
     """Поток, в котором редактор меняет офферы.
 
-    Приоритет — `default`-поток (его создаёт создаватор). На живом инстансе
+    `stream_id` приходит из формы удаления: один и тот же оффер может стоять
+    в нескольких потоках, и действие адресуется конкретному потоку. Без него
+    приоритет — `default`-поток (его создаёт создаватор). На живом инстансе
     встречаются кампании, где офферы лежат в `regular`-потоке: если поток с
     офферами ровно один, работаем с ним, а при неоднозначности просим выбрать
     поток в Keitaro — молча менять не тот поток хуже ошибки.
     """
     streams = await client.list_campaign_streams(campaign_id)
+    if stream_id is not None:
+        for stream in streams:
+            if stream.id == stream_id:
+                return stream
+        # Поток могли удалить в Keitaro уже после открытия страницы.
+        raise NotFound(f"в кампании {campaign_id} нет потока {stream_id}")
     defaults = sorted(
         (stream for stream in streams if stream.type == "default"),
         key=lambda stream: (stream.position or 0, stream.id),
@@ -493,14 +503,25 @@ async def remove_offer(
     offer_id: int,
     *,
     idempotency_key: str | None = None,
+    stream_id: int | None = None,
 ) -> OfferMutationResult:
     """Удаляет оффер из потока и пересчитывает веса оставшихся.
+
+    `stream_id` — поток из формы редактора: один оффер может стоять в
+    нескольких потоках, поэтому без него действие было бы неоднозначным.
+    Без `stream_id` (API) поток выбирается как раньше — через `_offer_stream`.
 
     Последний оффер удалить нельзя: поток остался бы без трафика, и кампания
     молча перестала бы конвертить. Ошибка — 422 с объяснением.
     """
     key = make_key(idempotency_key)
-    payload = {"campaign_id": campaign_id, "offer_id": offer_id}
+    payload: dict[str, Any] = {"campaign_id": campaign_id, "offer_id": offer_id}
+    if stream_id is not None:
+        # Поток — часть тела операции: удаление из другого потока это другое
+        # действие, и повтор с тем же ключом не должен засчитываться как оно.
+        # Ключ добавляем только когда он известен: у старых записей журнала
+        # поля нет, и их повтор по-прежнему совпадает по телу.
+        payload["stream_id"] = stream_id
     claim = await _claim(
         session, key=key, operation_type=OperationType.OFFER_REMOVE, payload=payload
     )
@@ -516,7 +537,7 @@ async def remove_offer(
 
     updated = False
     try:
-        stream = await _offer_stream(client, campaign_id)
+        stream = await _offer_stream(client, campaign_id, stream_id=stream_id)
         remaining = [offer for offer in stream.offers if offer.offer_id != offer_id]
         if len(remaining) == len(stream.offers):
             raise NotFound(f"оффер {offer_id} отсутствует в потоке {stream.id}")

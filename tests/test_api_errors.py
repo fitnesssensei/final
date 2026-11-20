@@ -10,8 +10,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import ProgrammingError
 
 from keitaro_wrapper.api.deps import SessionDep
-from keitaro_wrapper.api.errors import DATABASE_NOT_READY, handle_database_not_ready
+from keitaro_wrapper.api.errors import DATABASE_NOT_READY, handle_database_not_ready, keitaro_detail
 from keitaro_wrapper.db import OperationLog
+from keitaro_wrapper.keitaro import KeitaroNotFound, KeitaroValidationError
 from keitaro_wrapper.main import create_app, lifespan
 
 VALID_ENV = {
@@ -88,3 +89,36 @@ async def test_programming_error_does_not_leak_sql() -> None:
     assert response.status_code == 503
     assert body == {"detail": DATABASE_NOT_READY}
     assert "operation_log" not in body["detail"]
+
+
+def test_duplicate_name_detail_is_human_and_hides_internal_path() -> None:
+    """Занятое имя кампании: понятная подсказка без метода, пути и кода."""
+    error = KeitaroValidationError(
+        "POST /campaigns -> HTTP 422: name: Name has already used", status=422
+    )
+
+    detail = keitaro_detail(error)
+
+    assert "уже занято" in detail
+    assert "POST /campaigns" not in detail
+    assert "HTTP 422" not in detail
+
+
+def test_unknown_validation_keeps_field_but_drops_request_path() -> None:
+    """Неизвестный текст трекера: поле сохраняем, внутренний путь — нет."""
+    error = KeitaroValidationError(
+        "PUT /streams/42 -> HTTP 422: offers: must be present", status=422
+    )
+
+    detail = keitaro_detail(error)
+
+    assert "offers" in detail
+    assert "PUT /streams" not in detail
+    assert "HTTP 422" not in detail
+
+
+def test_not_found_detail_hides_request_path() -> None:
+    """404 тоже без внутреннего адреса: клиенту нужна сущность, а не путь."""
+    error = KeitaroNotFound("GET /campaigns/1 -> HTTP 404: Campaign not found", status=404)
+
+    assert keitaro_detail(error) == "в Keitaro не найдено: Campaign not found"

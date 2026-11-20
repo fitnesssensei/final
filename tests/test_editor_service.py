@@ -357,6 +357,56 @@ async def test_remove_without_default_uses_single_offer_stream(
     assert [offer.share for offer in result.offers] == [100]
 
 
+async def test_remove_offer_targets_given_stream(session: AsyncSession, stub: StubKeitaro) -> None:
+    """Один оффер в двух потоках: удаление адресуется конкретному потоку.
+
+    Без `stream_id` редактор берёт `default`-поток, поэтому удалить оффер из
+    другого потока было нельзя, а повтор с тем же ключом молча возвращал
+    «удалено», хотя в этом потоке оффер оставался.
+    """
+    stub.streams = [
+        stream_with([(OFFER_ID, 50), (SECOND_OFFER_ID, 50)], stream_id=1, stream_type="regular"),
+        stream_with([(OFFER_ID, 50), (SECOND_OFFER_ID, 50)], stream_id=2),
+    ]
+
+    result = await remove_offer(session, stub, CAMPAIGN_ID, OFFER_ID, stream_id=1)
+
+    assert result.stream_id == 1
+    assert [(offer.offer_id, offer.share) for offer in result.offers] == [(SECOND_OFFER_ID, 100)]
+    remaining = {stream.id: [offer.offer_id for offer in stream.offers] for stream in stub.streams}
+    assert remaining[1] == [SECOND_OFFER_ID]
+    # Второй поток не тронут: там тот же оффер со своей долей.
+    assert remaining[2] == [OFFER_ID, SECOND_OFFER_ID]
+
+
+async def test_same_key_for_two_streams_conflicts(session: AsyncSession, stub: StubKeitaro) -> None:
+    """Ключ от удаления в одном потоке нельзя переиспользовать для другого.
+
+    Тело операции содержит `stream_id`, поэтому повтор с тем же ключом для
+    другого потока — это другая операция: честный 409, а не «удалено».
+    """
+    stub.streams = [
+        stream_with([(OFFER_ID, 50), (SECOND_OFFER_ID, 50)], stream_id=1, stream_type="regular"),
+        stream_with([(OFFER_ID, 50), (SECOND_OFFER_ID, 50)], stream_id=2),
+    ]
+    await remove_offer(session, stub, CAMPAIGN_ID, OFFER_ID, stream_id=1, idempotency_key="two")
+
+    with pytest.raises(Conflict, match="другим телом"):
+        await remove_offer(session, stub, CAMPAIGN_ID, OFFER_ID, stream_id=2, idempotency_key="two")
+
+
+async def test_remove_offer_with_unknown_stream_returns_404(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Поток могли удалить в Keitaro: 404 с объяснением, без PUT."""
+    stub.streams = [stream_with([(OFFER_ID, 50), (SECOND_OFFER_ID, 50)])]
+
+    with pytest.raises(NotFound, match="нет потока"):
+        await remove_offer(session, stub, CAMPAIGN_ID, OFFER_ID, stream_id=999)
+
+    assert "update_stream" not in stub.names
+
+
 async def test_no_offer_stream_is_request_error(session: AsyncSession, stub: StubKeitaro) -> None:
     stub.streams = []
 

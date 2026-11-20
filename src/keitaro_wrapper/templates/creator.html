@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Создатель — Keitaro wrapper{% endblock %}
+{% block content %}
+<section class="page-head">
+  <h1>Создатель кампании</h1>
+  <p>Гео-поток на Google и поток на оффер создаются одним запросом.</p>
+</section>
+
+<div class="layout">
+  <form class="card form" method="post" action="/ui/creator" novalidate>
+    <input type="hidden" name="idempotency_key" value="{{ form.idempotency_key }}">
+
+    <label>Название кампании
+      <input name="name" value="{{ form.name }}" required maxlength="255" autofocus
+             placeholder="[TEST] Keitaro wrapper GEO">
+    </label>
+
+    <div class="row">
+      <label>Гео (ISO-2)
+        <input name="geo" value="{{ form.geo }}" required pattern="[A-Za-z]{2}"
+               maxlength="2" placeholder="MX" title="Две латинские буквы, например MX">
+      </label>
+      <label>Оффер
+        <select name="offer_id" required {% if not has_active_offers %}disabled{% endif %}>
+          {% if not has_active_offers %}
+            <option value="">— нет активных офферов —</option>
+          {% endif %}
+          {% for offer in options.offers %}
+            <option value="{{ offer.id }}"
+                    {% if offer.id == form.offer_id %}selected{% endif %}
+                    {% if offer.state not in (none, 'active') %}disabled{% endif %}>
+              {{ offer.name }}{% if offer.state and offer.state != 'active' %} · {{ offer.state }}{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+    {% if not has_active_offers %}
+      <div class="alert alert-warn" role="status">
+        В справочнике нет активных офферов: создавать кампанию не на что.
+        Обновите кэш или добавьте оффер в Keitaro.
+      </div>
+    {% endif %}
+    <p class="hint">Гео попадает в фильтр country первого потока; оффер — в default-поток со 100% трафика.</p>
+
+    <div class="row">
+      <label>Домен
+        <select name="domain_id" required>
+          {% for domain in options.domains %}
+            <option value="{{ domain.id }}" {% if domain.id == form.domain_id %}selected{% endif %}>
+              {{ domain.name }}{% if domain.state and domain.state != 'active' %} · {{ domain.state }}{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Группа кампаний
+        <select name="group_id" required>
+          {% for group in options.groups %}
+            <option value="{{ group.id }}" {% if group.id == form.group_id %}selected{% endif %}>
+              {{ group.name }}
+            </option>
+          {% endfor %}
+        </select>
+      </label>
+    </div>
+
+    <label>Источник трафика
+      <select name="traffic_source_id" required>
+        {% for source in options.traffic_sources %}
+          <option value="{{ source.id }}" {% if source.id == form.traffic_source_id %}selected{% endif %}>
+            {{ source.name }}
+          </option>
+        {% endfor %}
+      </select>
+    </label>
+
+    <button class="btn btn-primary" type="submit" {% if not has_active_offers %}disabled{% endif %}>
+      Создать кампанию
+    </button>
+  </form>
+
+  <aside class="card">
+    <h2>Что произойдёт</h2>
+    <ul class="aside-list">
+      <li>В Keitaro появится кампания с alias из названия и случайным суффиксом.</li>
+      <li>Поток 1: <code>country = ваше гео</code> → редирект на Google.</li>
+      <li>Поток 2: default → выбранный оффер, доля 100%.</li>
+      <li>После создания откроется редактор этой кампании.</li>
+    </ul>
+    <p class="hint" style="margin-top:14px">
+      Ключ идемпотентности уже в форме: повторная отправка не создаст дубль.
+    </p>
+    <p class="hint">
+      Значения из <code>.env</code>: домен {{ form.domain_id }},
+      группа {{ form.group_id }}, источник {{ form.traffic_source_id }}.
+      Если справочник пуст, при первом открытии страницы он читается из Keitaro.
+    </p>
+    <a class="btn" href="/ui/editor">Перейти в редактор</a>
+  </aside>
+</div>
+{% endblock %}
