@@ -1,19 +1,10 @@
 """Тесты скелета приложения: живость и сборка OpenAPI-схемы."""
 
-from collections.abc import AsyncIterator
-
 import httpx
-import pytest
 
 from keitaro_wrapper import __version__
-from keitaro_wrapper.main import create_app
 
-
-@pytest.fixture
-async def client() -> AsyncIterator[httpx.AsyncClient]:
-    transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
-        yield http_client
+# Фикстура `client` — общая, в tests/conftest.py
 
 
 async def test_health_returns_ok(client: httpx.AsyncClient) -> None:
@@ -30,3 +21,6 @@ async def test_openapi_schema_contains_health(client: httpx.AsyncClient) -> None
     schema = response.json()
     assert schema["info"]["version"] == __version__
     assert "/health" in schema["paths"]
+    # Literal["ok"] в схеме ответа: единственный возможный статус
+    status_schema = schema["components"]["schemas"]["HealthResponse"]["properties"]["status"]
+    assert status_schema["const"] == "ok"

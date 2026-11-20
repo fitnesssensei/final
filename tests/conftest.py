@@ -1,22 +1,43 @@
 """Общие фикстуры тестов."""
 
 import os
+from collections.abc import AsyncIterator
 
+import httpx
 import pytest
 
-from keitaro_wrapper.config import get_settings
+from keitaro_wrapper.config import Settings, get_settings
+from keitaro_wrapper.main import create_app
+
+
+@pytest.fixture
+async def client() -> AsyncIterator[httpx.AsyncClient]:
+    """HTTP-клиент поверх приложения без запуска `lifespan`.
+
+    Настройки не читаются, поэтому фикстура не зависит от окружения. Сценарии
+    со стартом приложения (fail-fast) проверяются в `tests/test_startup.py`.
+    """
+    transport = httpx.ASGITransport(app=create_app())
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
+        yield http_client
 
 
 @pytest.fixture(autouse=True)
-def _clear_keitaro_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Убирает переменные KEITARO_* из окружения на время теста.
+def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Отвязывает настройки от машины: убирает env vars и локальный `.env`.
 
-    `_env_file=None` отключает только `.env`, но не `os.environ`: без этой
-    фикстуры тесты настроек зависят от машины разработчика. Регистр не важен —
-    pydantic-settings по умолчанию сравнивает имена без учёта регистра.
+    `Settings` читает и `os.environ`, и `.env` из текущего каталога. Без этой
+    фикстуры прогон зависит от окружения разработчика: экспортированный
+    `LOG_LEVEL=verbose` ронял тесты настроек, а чужой `DATABASE_URL` подменял
+    дефолт. Имена переменных берутся из модели, поэтому новые поля настроек
+    попадут сюда автоматически. Сравнение регистронезависимое — pydantic-settings
+    по умолчанию не учитывает регистр в именах полей.
     """
-    for name in [key for key in os.environ if key.upper().startswith("KEITARO_")]:
+    field_names = {name.upper() for name in Settings.model_fields}
+    for name in [key for key in os.environ if key.upper() in field_names]:
         monkeypatch.delenv(name, raising=False)
+    # `.env` рядом с проектом тоже не должен влиять: у тестов своё окружение
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture(autouse=True)

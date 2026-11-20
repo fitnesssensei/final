@@ -28,6 +28,8 @@ def test_api_key_is_masked() -> None:
     settings = make_settings()
 
     assert "test-key" not in repr(settings)
+    # repr — не единственный выход: сериализация тоже не должна раскрывать ключ
+    assert "test-key" not in settings.model_dump_json()
     assert settings.keitaro_api_key.get_secret_value() == "test-key"
 
 

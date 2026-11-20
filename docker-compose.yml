@@ -1,7 +1,10 @@
 services:
   db:
     image: postgres:17-alpine
+    restart: unless-stopped
     environment:
+      # dev-only учётка: для боевого окружения — секреты оркестратора,
+      # см. «Оговорки по безопасности» в README
       POSTGRES_USER: keitaro
       POSTGRES_PASSWORD: keitaro
       POSTGRES_DB: keitaro_wrapper
@@ -18,13 +21,28 @@ services:
 
   app:
     build: .
+    restart: unless-stopped
     env_file:
       - .env
     environment:
       # внутри compose-сети БД доступна по имени сервиса и стандартному порту
       DATABASE_URL: postgresql+asyncpg://keitaro:keitaro@db:5432/keitaro_wrapper
+    # ближе к «прод»-виду: несколько воркеров uvicorn. Общего изменяемого
+    # состояния у воркеров нет (кэш настроек у каждого свой), поэтому это безопасно
+    command:
+      [
+        "uvicorn",
+        "keitaro_wrapper.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--workers",
+        "2",
+      ]
     ports:
       - "8000:8000"
+    # HEALTHCHECK наследуется из Dockerfile (GET http://127.0.0.1:8000/health)
     depends_on:
       db:
         condition: service_healthy
