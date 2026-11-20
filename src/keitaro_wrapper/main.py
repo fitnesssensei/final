@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from keitaro_wrapper import __version__
 from keitaro_wrapper.api.router import api_router
 from keitaro_wrapper.config import get_settings
+from keitaro_wrapper.keitaro import KeitaroClient
 from keitaro_wrapper.logging_setup import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -32,8 +33,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ) from exc
 
     configure_logging(settings.log_level)
+    # Клиент создаётся один раз на процесс: пул соединений живёт между запросами
+    client = KeitaroClient(settings.keitaro_api_root, settings.keitaro_api_key.get_secret_value())
+    app.state.keitaro = client
     logger.info("Приложение запущено, Keitaro Admin API: %s", settings.keitaro_api_root)
-    yield
+    try:
+        yield
+    finally:
+        # Закрываем соединения при штатной остановке и при падении старта
+        await client.aclose()
 
 
 def create_app() -> FastAPI:

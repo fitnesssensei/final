@@ -3,10 +3,13 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from keitaro_wrapper.api.deps import get_keitaro_client
+from keitaro_wrapper.keitaro import KeitaroClient
 from keitaro_wrapper.logging_setup import configure_logging
 from keitaro_wrapper.main import create_app, lifespan
 
@@ -72,6 +75,31 @@ async def test_startup_error_does_not_leak_values(monkeypatch: pytest.MonkeyPatc
 
     assert "keitaro_base_url" in str(exc_info.value)
     assert "SECRET42" not in str(exc_info.value)
+
+
+async def test_lifespan_creates_and_closes_keitaro_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Клиент поднимается на старте и закрывается на остановке — соединения не текут."""
+    set_env(monkeypatch)
+    app = create_app()
+
+    async with lifespan(app):
+        client = app.state.keitaro
+        assert isinstance(client, KeitaroClient)
+        assert client.api_root == "https://tlgk.host/admin_api/v1"
+        assert not client.is_closed
+
+    assert client.is_closed
+
+
+async def test_dependency_returns_client_from_app_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ручки будут получать тот же клиент, что создан в `lifespan`."""
+    set_env(monkeypatch)
+    app = create_app()
+
+    async with lifespan(app):
+        request = SimpleNamespace(app=app)
+
+        assert get_keitaro_client(request) is app.state.keitaro
 
 
 def test_configure_logging_applies_level() -> None:
