@@ -96,12 +96,23 @@ async def claim_operation(
 
 
 async def mark_succeeded(
-    session: AsyncSession, operation: OperationLog, *, external_id: str
+    session: AsyncSession,
+    operation: OperationLog,
+    *,
+    external_id: str,
+    result: dict[str, Any] | None = None,
 ) -> OperationLog:
-    """Фиксирует успех: внешний id кампании/потока и снятый текст ошибки."""
+    """Фиксирует успех: внешний id, снимок ответа и снятый текст ошибки.
+
+    `result` нужен идемпотентности: повтор с тем же ключом вернёт сохранённый
+    ответ, не создавая вторую кампанию. `None` оставляет прежнее значение —
+    так операция без результата (например, удаление) не затирает его пустотой.
+    """
     operation.status = OperationStatus.SUCCEEDED.value
     operation.external_id = external_id
     operation.error = None
+    if result is not None:
+        operation.result = result
     await session.flush()
     return operation
 

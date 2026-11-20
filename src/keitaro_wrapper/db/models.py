@@ -70,6 +70,10 @@ class OperationLog(Base):
         server_default=OperationStatus.PENDING.value,
     )
     error: Mapped[str | None] = mapped_column(Text)
+    # Снимок ответа API на успешную операцию: повтор с тем же ключом отдаёт
+    # его без обращения к Keitaro. JSON, а не набор колонок, потому что форма
+    # ответа отличается у создания кампании и у операций редактора.
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
