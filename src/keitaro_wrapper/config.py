@@ -6,8 +6,6 @@ from typing import Annotated, Literal
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-LOG_LEVELS = {"critical", "error", "warning", "info", "debug"}
-
 # Хосты, для которых допустим http://: локальный мок Keitaro и отладка на своей машине
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
@@ -26,8 +24,8 @@ class Settings(BaseSettings):
     )
 
     keitaro_base_url: HttpUrl
-    # min_length=1 — пустой KEITARO_API_KEY= из .env отсекается на старте,
-    # иначе приложение поднимается и падает с 401 на первом запросе к Keitaro
+    # min_length=1 — пустой KEITARO_API_KEY= из .env отсекается на старте:
+    # раньше приложение поднималось и падало с 401 на первом запросе к Keitaro
     keitaro_api_key: Annotated[SecretStr, Field(min_length=1)]
     keitaro_domain_id: int = Field(gt=0)
     keitaro_group_id: int = Field(gt=0)
@@ -66,14 +64,10 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("keitaro_base_url", "keitaro_google_url")
-    @classmethod
-    def _strip_trailing_slash(cls, value: HttpUrl) -> HttpUrl:
-        return HttpUrl(str(value).rstrip("/"))
-
     @field_validator("log_level", mode="before")
     @classmethod
     def _normalize_log_level(cls, value: object) -> object:
+        """`LOG_LEVEL=" INFO "` из `.env` приводится к виду, который ждёт Literal."""
         if isinstance(value, str):
             return value.strip().lower()
         return value
@@ -86,5 +80,9 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Кэшированный доступ к настройкам (валидация происходит при первом вызове)."""
+    """Кэшированный доступ к настройкам; первый вызов — в `lifespan` при старте.
+
+    `lru_cache` держит одно значение на процесс, тесты сбрасывают его фикстурой
+    `_reset_settings_cache` из `tests/conftest.py`.
+    """
     return Settings()

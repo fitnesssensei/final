@@ -16,7 +16,9 @@ format:
 	uv run ruff format .
 
 migrate:
-	uv run alembic upgrade head
+	@echo "Миграций пока нет: таблицы и Alembic появятся на шаге 3." >&2
+	@echo "До этого приложению БД не нужна, alembic.ini в проекте отсутствует." >&2
+	@exit 1
 
 up:
 	docker compose up --build
