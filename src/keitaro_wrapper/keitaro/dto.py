@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,11 +39,16 @@ class Campaign(KeitaroModel):
 
 
 class StreamFilter(KeitaroModel):
-    """Фильтр потока: у гео-потока это `country` в режиме `accept`."""
+    """Фильтр потока: у гео-потока это `country` в режиме `accept`.
+
+    `payload` приходит в двух формах: список (`["MX"]`) и строка с пробелами
+    (`"RU AU"` — проверено на живом инстансе). Обе формы надо сохранять как
+    есть, иначе редактор не прочитает поток и не вернёт его в `PUT`.
+    """
 
     name: str
     mode: str | None = None
-    payload: list[str] = Field(default_factory=list)
+    payload: list[str] | str = Field(default_factory=list)
 
 
 class StreamOffer(KeitaroModel):
@@ -55,7 +60,12 @@ class StreamOffer(KeitaroModel):
 
 
 class Stream(KeitaroModel):
-    """Поток кампании из `GET /campaigns/{id}/streams`."""
+    """Поток кампании из `GET /campaigns/{id}/streams`.
+
+    `triggers`/`landings`/`action_options` хранятся как есть: редактор
+    возвращает поток в `PUT` целиком, и потеря этих полей сбросила бы
+    настройки, которые он не меняет.
+    """
 
     id: int
     name: str
@@ -65,10 +75,18 @@ class Stream(KeitaroModel):
     schema_: str | None = Field(default=None, alias="schema")
     action_type: str | None = None
     action_payload: str | None = None
+    # Живой Keitaro отдаёт здесь null, объект или список — сохраняем как есть
+    action_options: dict[str, Any] | list[Any] | None = None
     position: int | None = None
     weight: int | None = None
+    state: str | None = None
+    comments: str | None = None
+    filter_or: bool | None = None
+    offer_selection: str | None = None
     collect_clicks: bool | None = None
     filters: list[StreamFilter] = Field(default_factory=list)
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
+    landings: list[dict[str, Any]] = Field(default_factory=list)
     offers: list[StreamOffer] = Field(default_factory=list)
 
 
@@ -120,6 +138,7 @@ class ReportRow(KeitaroModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     campaign: str | None = None
+    campaign_id: int | None = None
     stream: str | None = None
     offer: str | None = None
     clicks: int = 0
@@ -161,6 +180,36 @@ class StreamCreate(BaseModel):
     collect_clicks: bool = True
     position: int
     filters: list[StreamFilter] = Field(default_factory=list)
+    offers: list[StreamOffer] = Field(default_factory=list)
+
+
+class StreamUpdate(BaseModel):
+    """Тело `PUT /streams/{id}`: полный поток, который возвращает `GET`.
+
+    Редактор меняет только `offers`, но отправляет и остальные поля: Keitaro
+    при обновлении потока ждёт объект целиком. `None` не отправляется
+    (`exclude_none`), поэтому незаполненные поля не перетираются дефолтами.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    campaign_id: int
+    name: str
+    type: str
+    schema_: StreamSchema = Field(alias="schema")
+    action_type: str | None = None
+    action_payload: str | None = None
+    action_options: dict[str, Any] | list[Any] | None = None
+    collect_clicks: bool | None = None
+    position: int
+    weight: int | None = None
+    state: str | None = None
+    comments: str | None = None
+    filter_or: bool | None = None
+    offer_selection: str | None = None
+    filters: list[StreamFilter] = Field(default_factory=list)
+    triggers: list[dict[str, Any]] = Field(default_factory=list)
+    landings: list[dict[str, Any]] = Field(default_factory=list)
     offers: list[StreamOffer] = Field(default_factory=list)
 
 

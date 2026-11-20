@@ -15,6 +15,7 @@ from keitaro_wrapper.keitaro.dto import (
     StreamCreate,
     StreamFilter,
     StreamOffer,
+    StreamUpdate,
     TrafficSource,
 )
 from keitaro_wrapper.keitaro.errors import (
@@ -45,5 +46,6 @@ __all__ = [
     "StreamCreate",
     "StreamFilter",
     "StreamOffer",
+    "StreamUpdate",
     "TrafficSource",
 ]

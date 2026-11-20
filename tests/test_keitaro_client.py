@@ -17,6 +17,7 @@ from keitaro_wrapper.keitaro import (
     KeitaroValidationError,
     ReportRequest,
     StreamCreate,
+    StreamUpdate,
 )
 
 BASE = "https://example.keitaro.io"
@@ -165,6 +166,68 @@ async def test_list_campaign_streams_parses_schema_and_offers(keitaro: KeitaroCl
 
 
 @respx.mock
+async def test_stream_filter_string_payload_is_preserved(keitaro: KeitaroClient) -> None:
+    """Живой Keitaro отдаёт `country` и строкой `"RU AU"` — это не ошибка."""
+    respx.get(f"{API}/campaigns/42/streams").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 6,
+                    "name": "Google (RU)",
+                    "type": "regular",
+                    "campaign_id": 42,
+                    "schema": "redirect",
+                    "action_type": "http",
+                    "position": 1,
+                    "filters": [{"name": "country", "mode": "accept", "payload": "RU AU"}],
+                    "offers": [],
+                }
+            ],
+        )
+    )
+
+    streams = await keitaro.list_campaign_streams(42)
+
+    assert streams[0].filters[0].payload == "RU AU"
+
+
+@respx.mock
+async def test_stream_action_options_accepts_null_and_list(keitaro: KeitaroClient) -> None:
+    """Живой Keitaro отдаёт `action_options` как null, объект или список."""
+    respx.get(f"{API}/campaigns/42/streams").mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 6,
+                    "name": "A",
+                    "type": "regular",
+                    "schema": "redirect",
+                    "action_type": "http",
+                    "position": 1,
+                    "action_options": None,
+                },
+                {
+                    "id": 7,
+                    "name": "B",
+                    "type": "default",
+                    "schema": "landings",
+                    "action_type": "http",
+                    "position": 2,
+                    "action_options": [{"name": "option"}],
+                },
+            ],
+        )
+    )
+
+    streams = await keitaro.list_campaign_streams(42)
+
+    assert streams[0].action_options is None
+    assert streams[1].action_options == [{"name": "option"}]
+
+
+@respx.mock
 async def test_create_stream_sends_schema_alias_and_offers(keitaro: KeitaroClient) -> None:
     route = respx.post(f"{API}/streams").mock(return_value=httpx.Response(200, json=STREAM))
     payload = StreamCreate(
@@ -207,6 +270,53 @@ async def test_update_stream_puts_payload(keitaro: KeitaroClient) -> None:
 
 
 @respx.mock
+async def test_update_stream_sends_full_stream(keitaro: KeitaroClient) -> None:
+    """Редактор шлёт полный поток: triggers/landings/вес не должны потеряться."""
+    route = respx.put(f"{API}/streams/7").mock(return_value=httpx.Response(200, json=STREAM))
+    payload = StreamUpdate(
+        campaign_id=42,
+        name="Offers",
+        type="default",
+        schema_="landings",
+        action_type="http",
+        action_payload="",
+        collect_clicks=True,
+        position=2,
+        weight=100,
+        state="active",
+        comments="поток офферов",
+        filter_or=True,
+        offer_selection="before_click",
+        filters=[{"name": "country", "mode": "accept", "payload": ["MX"]}],
+        triggers=[{"name": "conversion"}],
+        landings=[{"landing_id": 5, "share": 100}],
+        offers=[{"offer_id": 18813, "share": 100}],
+    )
+
+    await keitaro.update_stream(7, payload)
+
+    assert json.loads(route.calls.last.request.content) == {
+        "campaign_id": 42,
+        "name": "Offers",
+        "type": "default",
+        "schema": "landings",
+        "action_type": "http",
+        "action_payload": "",
+        "collect_clicks": True,
+        "position": 2,
+        "weight": 100,
+        "state": "active",
+        "comments": "поток офферов",
+        "filter_or": True,
+        "offer_selection": "before_click",
+        "filters": [{"name": "country", "mode": "accept", "payload": ["MX"]}],
+        "triggers": [{"name": "conversion"}],
+        "landings": [{"landing_id": 5, "share": 100}],
+        "offers": [{"offer_id": 18813, "share": 100}],
+    }
+
+
+@respx.mock
 async def test_list_groups_sends_required_type(keitaro: KeitaroClient) -> None:
     route = respx.get(f"{API}/groups", params={"type": "offers"}).mock(
         return_value=httpx.Response(
@@ -229,6 +339,7 @@ async def test_build_report_posts_body_and_parses_rows(keitaro: KeitaroClient) -
                 "rows": [
                     {
                         "campaign": "MX test",
+                        "campaign_id": 42,
                         "stream": "Google (MX)",
                         "offer": None,
                         "clicks": 10,
@@ -246,6 +357,7 @@ async def test_build_report_posts_body_and_parses_rows(keitaro: KeitaroClient) -
     report = await keitaro.build_report(payload)
 
     assert report.total == 1
+    assert report.rows[0].campaign_id == 42
     assert report.rows[0].clicks == 10
     assert json.loads(route.calls.last.request.content) == {
         "dimensions": ["campaign", "stream", "offer"],

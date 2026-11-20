@@ -27,6 +27,7 @@ from keitaro_wrapper.keitaro.dto import (
     ReportResponse,
     Stream,
     StreamCreate,
+    StreamUpdate,
     TrafficSource,
 )
 from keitaro_wrapper.keitaro.errors import (
@@ -350,7 +351,8 @@ class KeitaroClient:
         data = await self._request("POST", path, body=body)
         return _parse_model(Stream, data, method="POST", path=path)
 
-    async def update_stream(self, stream_id: int, payload: StreamCreate) -> Stream:
+    async def update_stream(self, stream_id: int, payload: StreamCreate | StreamUpdate) -> Stream:
+        """`StreamCreate` — совместимость с создавателем; редактор шлёт полный поток."""
         body = payload.model_dump(by_alias=True, exclude_none=True)
         path = f"/streams/{stream_id}"
         data = await self._request("PUT", path, body=body)

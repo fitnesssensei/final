@@ -21,26 +21,27 @@ import secrets
 import string
 from collections.abc import Sequence
 from typing import Any
-from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from keitaro_wrapper.config import Settings
-from keitaro_wrapper.db.directories import DirectoryEntry, list_directory, replace_directory
-from keitaro_wrapper.db.models import DictionaryCache, OperationLog, OperationStatus, OperationType
-from keitaro_wrapper.db.operations import claim_operation, mark_failed, mark_succeeded
+from keitaro_wrapper.db.directories import entries_from_models, list_directory, replace_directory
+from keitaro_wrapper.db.models import DictionaryCache, OperationType
+from keitaro_wrapper.db.operations import claim_operation, mark_succeeded
 from keitaro_wrapper.keitaro import (
     Campaign,
     CampaignCreate,
     KeitaroClient,
     KeitaroError,
-    KeitaroNotFound,
     Stream,
     StreamCreate,
     StreamFilter,
     StreamOffer,
 )
+from keitaro_wrapper.services.errors import RequestError, ServiceError
+from keitaro_wrapper.services.idempotency import make_key, record_failure, replay
+from keitaro_wrapper.services.offers import require_active_offer
 
 logger = logging.getLogger(__name__)
 
@@ -48,24 +49,6 @@ GEO_RE = re.compile(r"^[A-Z]{2}$")
 ALIAS_SLUG_LIMIT = 24
 ALIAS_SUFFIX_LIMIT = 6
 OFFER_SHARE = 100
-
-
-class CampaignError(Exception):
-    """Ошибка сценария создания кампании, которую надо показать клиенту."""
-
-    status_code = 422
-
-
-class CampaignRequestError(CampaignError):
-    """Запрос не выполним: нет сущности, оффер неактивен и т.п. (422)."""
-
-    status_code = 422
-
-
-class IdempotencyConflict(CampaignError):
-    """Ключ уже использован и повторять операцию нельзя (409)."""
-
-    status_code = 409
 
 
 class CampaignRequest(BaseModel):
@@ -187,16 +170,6 @@ def build_offer_stream(campaign_id: int, offer_id: int) -> StreamCreate:
     )
 
 
-def _directory_entries(items: Sequence[Any]) -> list[DirectoryEntry]:
-    """Переводит DTO Keitaro в записи кэша: id строкой, исходный JSON целиком."""
-    return [
-        DirectoryEntry(
-            external_id=str(item.id), name=item.name, payload=item.model_dump(mode="json")
-        )
-        for item in items
-    ]
-
-
 async def _refresh_directory(session: AsyncSession, client: KeitaroClient, kind: str) -> None:
     """Читает справочник из Keitaro и полностью заменяет локальный кэш."""
     if kind == "domains":
@@ -208,7 +181,7 @@ async def _refresh_directory(session: AsyncSession, client: KeitaroClient, kind:
         items = await client.list_traffic_sources()
     else:
         raise ValueError(f"неизвестный справочник: {kind!r}")
-    await replace_directory(session, kind=kind, entries=_directory_entries(items))
+    await replace_directory(session, kind=kind, entries=entries_from_models(items))
 
 
 def _find_entry(
@@ -245,7 +218,7 @@ async def _require_entry(
         await _refresh_directory(session, client, kind)
         entry = _find_entry(await list_directory(session, kind), entity_id, kind)
     if entry is None:
-        raise CampaignRequestError(
+        raise RequestError(
             f"{label} с id={entity_id} отсутствует в Keitaro — проверьте KEITARO_* в .env"
         )
     return entry
@@ -268,22 +241,6 @@ async def _validate_directories(
         entity_id=settings.keitaro_source_id,
         label="источник трафика",
     )
-
-
-async def _validate_offer(client: KeitaroClient, offer_id: int) -> None:
-    """Оффер читается напрямую: кэш мог устареть, а кампания — нет.
-
-    404 Keitaro превращается в понятную 422 (в запросе неверный `offer_id`),
-    а не в 404 «ручка не найдена».
-    """
-    try:
-        offer = await client.get_offer(offer_id)
-    except KeitaroNotFound as exc:
-        raise CampaignRequestError(f"оффер {offer_id} не найден в Keitaro") from exc
-    if offer.state != "active":
-        raise CampaignRequestError(
-            f"оффер {offer_id} не активен: state={offer.state or 'не указан'}"
-        )
 
 
 async def _create_streams(
@@ -325,41 +282,6 @@ async def _compensate(client: KeitaroClient, campaign: Campaign | None) -> str:
     return ""
 
 
-async def _record_failure(session: AsyncSession, operation: OperationLog, error: str) -> None:
-    """Пишет ошибку в журнал; сбой записи не должен подменять исходное исключение."""
-    try:
-        await mark_failed(session, operation, error=error)
-        await session.commit()
-    except Exception:
-        logger.exception("не удалось записать ошибку операции %s", operation.idempotency_key)
-        await session.rollback()
-
-
-def _replay(operation: OperationLog, payload: dict[str, Any]) -> CampaignResult:
-    """Возвращает сохранённый результат или объясняет, почему повтор запрещён."""
-    if operation.payload != payload:
-        raise IdempotencyConflict(
-            "Idempotency-Key уже использован с другим телом запроса — "
-            "для новой кампании нужен новый ключ"
-        )
-    if operation.status == OperationStatus.SUCCEEDED.value:
-        if operation.result is None:
-            raise IdempotencyConflict(
-                f"кампания {operation.external_id} создана, но результат не сохранён: "
-                "проверьте её в Keitaro"
-            )
-        stored = CampaignResult.model_validate(operation.result)
-        return stored.model_copy(update={"replayed": True})
-    if operation.status == OperationStatus.PENDING.value:
-        raise IdempotencyConflict(
-            "операция с этим Idempotency-Key ещё выполняется — повторите запрос позже"
-        )
-    raise IdempotencyConflict(
-        f"операция с этим Idempotency-Key завершилась ошибкой: "
-        f"{operation.error or 'без текста'}; исправьте причину и повторите с новым ключом"
-    )
-
-
 async def create_campaign(
     session: AsyncSession,
     client: KeitaroClient,
@@ -374,7 +296,7 @@ async def create_campaign(
     параллельный запрос с тем же ключом не увидел бы `pending` и тоже создал бы
     кампанию. Каждая точка отказа после создания кампании компенсируется.
     """
-    key = (idempotency_key or "").strip() or uuid4().hex
+    key = make_key(idempotency_key)
     payload = request.model_dump(mode="json")
     try:
         claim = await claim_operation(
@@ -384,10 +306,15 @@ async def create_campaign(
             payload=payload,
         )
     except ValueError as exc:
-        raise CampaignRequestError(str(exc)) from exc
+        raise RequestError(str(exc)) from exc
 
     if not claim.created:
-        return _replay(claim.operation, payload)
+        return replay(
+            claim.operation,
+            payload,
+            CampaignResult,
+            operation_type=OperationType.CAMPAIGN_CREATE,
+        )
 
     # `pending` должна быть видна другим воркерам до сетевых вызовов
     await session.commit()
@@ -396,7 +323,7 @@ async def create_campaign(
     campaign_ready = False
     try:
         await _validate_directories(session, client, settings)
-        await _validate_offer(client, request.offer_id)
+        await require_active_offer(client, request.offer_id)
         # Отпускаем соединение с БД до сетевых вызовов: иначе транзакция,
         # открытая чтением справочников, держит его всё время создания потоков.
         await session.commit()
@@ -437,13 +364,13 @@ async def create_campaign(
         )
         await session.commit()
         return result
-    except CampaignError as exc:
+    except ServiceError as exc:
         # Ошибка до создания кампании: компенсировать нечего
-        await _record_failure(session, claim.operation, str(exc))
+        await record_failure(session, claim.operation, str(exc))
         raise
     except KeitaroError as exc:
         note = "" if campaign_ready else await _compensate(client, campaign)
-        await _record_failure(session, claim.operation, f"{exc}{note}")
+        await record_failure(session, claim.operation, f"{exc}{note}")
         raise
     except Exception as exc:
         if campaign_ready:
@@ -457,5 +384,5 @@ async def create_campaign(
             note = "; кампания создана, но результат не сохранён — проверьте её в Keitaro"
         else:
             note = await _compensate(client, campaign)
-        await _record_failure(session, claim.operation, f"{type(exc).__name__}: {exc}{note}")
+        await record_failure(session, claim.operation, f"{type(exc).__name__}: {exc}{note}")
         raise

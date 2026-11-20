@@ -25,7 +25,7 @@ from keitaro_wrapper.keitaro.errors import (
     KeitaroUnavailable,
     KeitaroValidationError,
 )
-from keitaro_wrapper.services.campaigns import CampaignError
+from keitaro_wrapper.services.errors import ServiceError
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +87,10 @@ async def handle_keitaro_error(request: Request, exc: Exception) -> JSONResponse
     return JSONResponse(status_code=_keitaro_status(exc), content={"detail": _keitaro_detail(exc)})
 
 
-async def handle_campaign_error(request: Request, exc: Exception) -> JSONResponse:
-    """Ошибки сценария создания кампании: 422 «не выполнимо», 409 «ключ занят»."""
-    assert isinstance(exc, CampaignError)  # обработчик зарегистрирован на этот класс
-    logger.info("Кампания (%s %s): %s", request.method, request.url.path, exc)
+async def handle_service_error(request: Request, exc: Exception) -> JSONResponse:
+    """Ошибки сценариев: 422 «не выполнимо», 409 «состояние не позволяет», 404."""
+    assert isinstance(exc, ServiceError)  # обработчик зарегистрирован на этот класс
+    logger.info("Сценарий (%s %s): %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
@@ -108,4 +108,4 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ConnectionError, handle_database_not_ready)
     # Starlette ищет обработчик по MRO, поэтому базовых классов достаточно
     app.add_exception_handler(KeitaroError, handle_keitaro_error)
-    app.add_exception_handler(CampaignError, handle_campaign_error)
+    app.add_exception_handler(ServiceError, handle_service_error)

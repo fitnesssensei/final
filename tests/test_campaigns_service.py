@@ -16,8 +16,6 @@ from keitaro_wrapper.db.operations import claim_operation, find_operation
 from keitaro_wrapper.keitaro import Domain, KeitaroUnavailable, Offer
 from keitaro_wrapper.services.campaigns import (
     CampaignRequest,
-    CampaignRequestError,
-    IdempotencyConflict,
     build_campaign,
     build_google_stream,
     build_offer_stream,
@@ -25,6 +23,7 @@ from keitaro_wrapper.services.campaigns import (
     google_redirect,
     make_alias,
 )
+from keitaro_wrapper.services.errors import Conflict, RequestError
 
 GOOGLE_URL = "https://www.google.com"
 
@@ -299,7 +298,7 @@ async def test_same_key_with_different_payload_conflicts(
     await create_campaign(session, stub, settings, request_payload, idempotency_key="key-same")
 
     other = CampaignRequest(name="Другая кампания", geo="PE", offer_id=18813)
-    with pytest.raises(IdempotencyConflict, match="другим телом"):
+    with pytest.raises(Conflict, match="другим телом"):
         await create_campaign(session, stub, settings, other, idempotency_key="key-same")
 
     assert stub.names.count("create_campaign") == 1
@@ -320,7 +319,7 @@ async def test_pending_operation_conflicts(
     )
     await session.commit()
 
-    with pytest.raises(IdempotencyConflict, match="ещё выполняется"):
+    with pytest.raises(Conflict, match="ещё выполняется"):
         await create_campaign(session, stub, settings, request_payload, idempotency_key="key-busy")
 
     assert "create_campaign" not in stub.names
@@ -336,7 +335,7 @@ async def test_failed_operation_cannot_be_replayed(
     with pytest.raises(KeitaroUnavailable):
         await create_campaign(session, stub, settings, request_payload, idempotency_key="key-bad")
 
-    with pytest.raises(IdempotencyConflict, match="завершилась ошибкой"):
+    with pytest.raises(Conflict, match="завершилась ошибкой"):
         await create_campaign(session, stub, settings, request_payload, idempotency_key="key-bad")
 
 
@@ -348,7 +347,7 @@ async def test_missing_offer_is_request_error(
     """404 по офферу — это 422 «неверный offer_id», а не 404 ручки."""
     stub = StubKeitaro(offers={})
 
-    with pytest.raises(CampaignRequestError, match="не найден в Keitaro"):
+    with pytest.raises(RequestError, match="не найден в Keitaro"):
         await create_campaign(session, stub, settings, request_payload, idempotency_key="key-offer")
 
     assert "create_campaign" not in stub.names
@@ -363,7 +362,7 @@ async def test_inactive_offer_is_request_error(
 ) -> None:
     stub = StubKeitaro(offers={18813: Offer(id=18813, name="Peru", state="paused")})
 
-    with pytest.raises(CampaignRequestError, match="не активен"):
+    with pytest.raises(RequestError, match="не активен"):
         await create_campaign(
             session, stub, settings, request_payload, idempotency_key="key-paused"
         )
@@ -379,7 +378,7 @@ async def test_missing_configured_domain_is_request_error(
     """Сущность из `.env` отсутствует в Keitaro — понятная 422 до создания."""
     stub = StubKeitaro(domains=[Domain(id=1, name="other.example")])
 
-    with pytest.raises(CampaignRequestError, match="домен с id=1813"):
+    with pytest.raises(RequestError, match="домен с id=1813"):
         await create_campaign(
             session, stub, settings, request_payload, idempotency_key="key-domain"
         )
@@ -409,7 +408,7 @@ async def test_too_long_key_is_rejected_before_keitaro(
     settings: Settings,
     request_payload: CampaignRequest,
 ) -> None:
-    with pytest.raises(CampaignRequestError, match="длиннее 128"):
+    with pytest.raises(RequestError, match="длиннее 128"):
         await create_campaign(session, stub, settings, request_payload, idempotency_key="k" * 129)
 
     assert stub.calls == []

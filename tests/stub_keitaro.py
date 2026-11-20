@@ -18,13 +18,58 @@ from keitaro_wrapper.keitaro import (
     KeitaroUnavailable,
     KeitaroValidationError,
     Offer,
+    ReportRequest,
+    ReportResponse,
+    ReportRow,
     Stream,
     StreamCreate,
+    StreamOffer,
+    StreamUpdate,
     TrafficSource,
 )
 
 CAMPAIGN_ID = 1001
 DEFAULT_STREAM_ID = 777
+OFFER_ID = 18813
+SECOND_OFFER_ID = 18814
+DEFAULT_CAMPAIGN = Campaign(
+    id=CAMPAIGN_ID,
+    name="MX test",
+    alias="mx-test-ab12cd",
+    state="active",
+    type="position",
+    domain_id=1813,
+    group_id=10332,
+    traffic_source_id=836,
+)
+DEFAULT_STREAMS = [
+    Stream(
+        id=1,
+        name="Google (MX)",
+        type="regular",
+        campaign_id=CAMPAIGN_ID,
+        schema_="redirect",
+        action_type="http",
+        position=1,
+        weight=100,
+    ),
+    Stream(
+        id=2,
+        name="Offers",
+        type="default",
+        campaign_id=CAMPAIGN_ID,
+        schema_="landings",
+        action_type="http",
+        position=2,
+        weight=100,
+        offers=[StreamOffer(offer_id=OFFER_ID, share=100, state="active")],
+    ),
+]
+DEFAULT_REPORT_ROWS = [
+    ReportRow(campaign_id=CAMPAIGN_ID, offer=None, clicks=5, conversions=0),
+    ReportRow(campaign_id=CAMPAIGN_ID, offer="Peru", clicks=10, conversions=2),
+    ReportRow(campaign_id=999, offer="Peru", clicks=99, conversions=9),
+]
 
 
 class StubKeitaro:
@@ -37,7 +82,11 @@ class StubKeitaro:
         groups: list[Group] | None = None,
         traffic_sources: list[TrafficSource] | None = None,
         offers: dict[int, Offer] | None = None,
+        campaigns: list[Campaign] | None = None,
+        streams: list[Stream] | None = None,
+        report_rows: list[ReportRow] | None = None,
         auto_default_stream: bool = False,
+        report_fails: bool = False,
         fail_stage: str | None = None,
         compensate_fails: bool = False,
     ) -> None:
@@ -49,11 +98,22 @@ class StubKeitaro:
             [TrafficSource(id=836, name="Google")] if traffic_sources is None else traffic_sources
         )
         self.offers = (
-            {18813: Offer(id=18813, name="Peru", country=["Peru"], state="active")}
+            {
+                OFFER_ID: Offer(id=OFFER_ID, name="Peru", country=["Peru"], state="active"),
+                SECOND_OFFER_ID: Offer(
+                    id=SECOND_OFFER_ID, name="Second", country=["Mexico"], state="active"
+                ),
+            }
             if offers is None
             else offers
         )
+        self.campaigns = [DEFAULT_CAMPAIGN] if campaigns is None else campaigns
+        # Пустой список по умолчанию: создаватель проверяет, что Keitaro сам
+        # завёл default-поток, только когда включён `auto_default_stream`.
+        self.streams = [] if streams is None else streams
+        self.report_rows = DEFAULT_REPORT_ROWS if report_rows is None else report_rows
         self.auto_default_stream = auto_default_stream
+        self.report_fails = report_fails
         self.fail_stage = fail_stage
         self.compensate_fails = compensate_fails
         self.calls: list[tuple[str, Any]] = []
@@ -64,6 +124,10 @@ class StubKeitaro:
     def names(self) -> list[str]:
         """Имена вызовов по порядку — для проверки, что лишних обращений нет."""
         return [name for name, _ in self.calls]
+
+    async def list_offers(self) -> list[Offer]:
+        self.calls.append(("list_offers", None))
+        return list(self.offers.values())
 
     async def get_offer(self, offer_id: int) -> Offer:
         self.calls.append(("get_offer", offer_id))
@@ -107,22 +171,41 @@ class StubKeitaro:
             traffic_source_id=payload.traffic_source_id,
         )
 
+    async def list_campaigns(self) -> list[Campaign]:
+        self.calls.append(("list_campaigns", None))
+        return self.campaigns
+
+    async def get_campaign(self, campaign_id: int) -> Campaign:
+        self.calls.append(("get_campaign", campaign_id))
+        for campaign in self.campaigns:
+            if campaign.id == campaign_id:
+                return campaign
+        raise KeitaroNotFound(
+            f"GET /campaigns/{campaign_id} -> HTTP 404: Campaign not found", status=404
+        )
+
+    async def build_report(self, payload: ReportRequest) -> ReportResponse:
+        self.calls.append(("build_report", payload))
+        if self.report_fails:
+            raise KeitaroUnavailable("POST /report/build -> HTTP 503: Service Unavailable")
+        return ReportResponse(rows=self.report_rows, total=len(self.report_rows))
+
     async def list_campaign_streams(self, campaign_id: int) -> list[Stream]:
         self.calls.append(("list_campaign_streams", campaign_id))
-        if not self.auto_default_stream:
-            return []
-        return [
-            Stream(
-                id=DEFAULT_STREAM_ID,
-                name="Default",
-                type="default",
-                campaign_id=campaign_id,
-                schema_="landings",
-                position=1,
-            )
-        ]
+        if self.auto_default_stream:
+            return [
+                Stream(
+                    id=DEFAULT_STREAM_ID,
+                    name="Default",
+                    type="default",
+                    campaign_id=campaign_id,
+                    schema_="landings",
+                    position=1,
+                )
+            ]
+        return list(self.streams)
 
-    def _stream_from(self, stream_id: int, payload: StreamCreate) -> Stream:
+    def _stream_from(self, stream_id: int, payload: StreamCreate | StreamUpdate) -> Stream:
         return Stream(
             id=stream_id,
             name=payload.name,
@@ -133,6 +216,9 @@ class StubKeitaro:
             action_payload=payload.action_payload,
             collect_clicks=payload.collect_clicks,
             position=payload.position,
+            weight=getattr(payload, "weight", None),
+            state=getattr(payload, "state", None),
+            filter_or=getattr(payload, "filter_or", None),
             filters=payload.filters,
             offers=payload.offers,
         )
@@ -146,11 +232,13 @@ class StubKeitaro:
         self._stream_seq += 1
         return self._stream_from(self._stream_seq, payload)
 
-    async def update_stream(self, stream_id: int, payload: StreamCreate) -> Stream:
+    async def update_stream(self, stream_id: int, payload: StreamCreate | StreamUpdate) -> Stream:
         self.calls.append(("update_stream", (stream_id, payload)))
         if self.fail_stage == "update":
             raise KeitaroUnavailable("PUT /streams -> HTTP 503: Service Unavailable")
-        return self._stream_from(stream_id, payload)
+        updated = self._stream_from(stream_id, payload)
+        self.streams = [updated if stream.id == stream_id else stream for stream in self.streams]
+        return updated
 
     async def delete_campaign(self, campaign_id: int) -> None:
         self.calls.append(("delete_campaign", campaign_id))
