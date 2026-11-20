@@ -14,6 +14,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from keitaro_wrapper.keitaro.dto import (
     Campaign,
@@ -49,6 +50,66 @@ RETRY_EXCEPTIONS = (httpx.TimeoutException, httpx.TransportError)
 Sleep = Callable[[float], Awaitable[None]]
 
 
+def _format_validation_error(exc: ValidationError) -> str:
+    """Первые ошибки pydantic одной строкой: `id: Field required; alias: ...`."""
+    parts = []
+    for error in exc.errors()[:3]:
+        location = ".".join(str(item) for item in error["loc"])
+        parts.append(f"{location}: {error['msg']}")
+    return "; ".join(parts)
+
+
+def _parse_list[ModelT: BaseModel](
+    model: type[ModelT], data: Any, *, method: str, path: str
+) -> list[ModelT]:
+    """Разбирает список сущностей, превращая неверный формат в доменную ошибку.
+
+    Пустое тело (204/200 без контента) — это «данных нет», а объект вместо
+    списка — ошибка контракта: выше по стеку её надо показывать как ошибку
+    Keitaro, а не как 500 от pydantic.
+    """
+    if data is None:
+        return []
+    if not isinstance(data, list):
+        raise KeitaroError(
+            f"{method} {path} -> ожидался список, пришло {type(data).__name__}",
+            method=method,
+            path=path,
+        )
+    try:
+        return [model.model_validate(item) for item in data]
+    except ValidationError as exc:
+        raise KeitaroError(
+            f"{method} {path} -> неверный формат элемента: {_format_validation_error(exc)}",
+            method=method,
+            path=path,
+        ) from exc
+
+
+def _parse_model[ModelT: BaseModel](
+    model: type[ModelT], data: Any, *, method: str, path: str
+) -> ModelT:
+    """Разбирает одну сущность; вместо `ValidationError` поднимает `KeitaroError`."""
+    if data is None:
+        raise KeitaroError(
+            f"{method} {path} -> пустой ответ вместо объекта", method=method, path=path
+        )
+    if not isinstance(data, dict):
+        raise KeitaroError(
+            f"{method} {path} -> ожидался объект, пришло {type(data).__name__}",
+            method=method,
+            path=path,
+        )
+    try:
+        return model.model_validate(data)
+    except ValidationError as exc:
+        raise KeitaroError(
+            f"{method} {path} -> неверный формат ответа: {_format_validation_error(exc)}",
+            method=method,
+            path=path,
+        ) from exc
+
+
 class KeitaroClient:
     """Обёртка над httpx: заголовок `Api-Key`, ретраи и доменные ошибки."""
 
@@ -66,7 +127,9 @@ class KeitaroClient:
         if not api_root.strip() or not api_key.strip():
             raise ValueError("нужны адрес Admin API и ключ: проверьте KEITARO_* в .env")
         self.api_root = api_root.rstrip("/")
-        self._api_key = api_key
+        # Ключ обрезаем здесь, а не только в Settings: клиент конструируют
+        # и скрипты, а `Api-Key` с пробелами Keitaro отвергает как 401.
+        self._api_key = api_key.strip()
         self._retries = retries
         self._backoff = backoff
         self._max_backoff = max_backoff
@@ -182,13 +245,31 @@ class KeitaroClient:
 
     @staticmethod
     def _json_or_none(response: httpx.Response) -> Any:
-        """Тело ответа как JSON; пустое или не-JSON тело — None."""
+        """JSON тела ошибки, если он есть: разбор не обязателен, текст берём из body."""
         if not response.content:
             return None
         try:
             return response.json()
         except ValueError:
             return None
+
+    @staticmethod
+    def _success_payload(method: str, path: str, response: httpx.Response) -> Any:
+        """JSON успешного ответа; пустое тело — None, не-JSON — доменная ошибка.
+
+        «200 + HTML» отдают заглушка Cloudflare, страница обслуживания и неверный
+        `KEITARO_BASE_URL`. Вернуть в этом случае None значит показать вызывающему
+        коду «данных нет» вместо реальной причины, поэтому такой ответ — ошибка.
+        """
+        if not response.content:
+            return None
+        try:
+            return response.json()
+        except ValueError as exc:
+            snippet = " ".join(response.text.split())[:100] or "<пустое тело>"
+            raise KeitaroError(
+                f"{method} {path} -> ответ не JSON: {snippet}", method=method, path=path
+            ) from exc
 
     @staticmethod
     def _error_text(response: httpx.Response, payload: Any) -> str:
@@ -215,10 +296,10 @@ class KeitaroClient:
 
     def _handle_response(self, method: str, path: str, response: httpx.Response) -> Any:
         """Возвращает JSON успешного ответа или поднимает доменную ошибку."""
-        payload = self._json_or_none(response)
         if response.is_success:
-            return payload
+            return self._success_payload(method, path, response)
 
+        payload = self._json_or_none(response)
         message = f"{method} {path} -> HTTP {response.status_code}: "
         message += self._error_text(response, payload)
         details = {
@@ -240,61 +321,73 @@ class KeitaroClient:
     # --- Кампании и потоки -------------------------------------------------
 
     async def list_campaigns(self) -> list[Campaign]:
-        data = await self._request("GET", "/campaigns")
-        return [Campaign.model_validate(item) for item in data or []]
+        path = "/campaigns"
+        data = await self._request("GET", path)
+        return _parse_list(Campaign, data, method="GET", path=path)
 
     async def get_campaign(self, campaign_id: int) -> Campaign:
-        data = await self._request("GET", f"/campaigns/{campaign_id}")
-        return Campaign.model_validate(data or {})
+        path = f"/campaigns/{campaign_id}"
+        data = await self._request("GET", path)
+        return _parse_model(Campaign, data, method="GET", path=path)
 
     async def create_campaign(self, payload: CampaignCreate) -> Campaign:
-        data = await self._request("POST", "/campaigns", body=payload.model_dump(exclude_none=True))
-        return Campaign.model_validate(data or {})
+        path = "/campaigns"
+        data = await self._request("POST", path, body=payload.model_dump(exclude_none=True))
+        return _parse_model(Campaign, data, method="POST", path=path)
 
     async def delete_campaign(self, campaign_id: int) -> None:
         """Архивирует кампанию: Keitaro не удаляет её физически."""
         await self._request("DELETE", f"/campaigns/{campaign_id}")
 
     async def list_campaign_streams(self, campaign_id: int) -> list[Stream]:
-        data = await self._request("GET", f"/campaigns/{campaign_id}/streams")
-        return [Stream.model_validate(item) for item in data or []]
+        path = f"/campaigns/{campaign_id}/streams"
+        data = await self._request("GET", path)
+        return _parse_list(Stream, data, method="GET", path=path)
 
     async def create_stream(self, payload: StreamCreate) -> Stream:
         body = payload.model_dump(by_alias=True, exclude_none=True)
-        data = await self._request("POST", "/streams", body=body)
-        return Stream.model_validate(data or {})
+        path = "/streams"
+        data = await self._request("POST", path, body=body)
+        return _parse_model(Stream, data, method="POST", path=path)
 
     async def update_stream(self, stream_id: int, payload: StreamCreate) -> Stream:
         body = payload.model_dump(by_alias=True, exclude_none=True)
-        data = await self._request("PUT", f"/streams/{stream_id}", body=body)
-        return Stream.model_validate(data or {})
+        path = f"/streams/{stream_id}"
+        data = await self._request("PUT", path, body=body)
+        return _parse_model(Stream, data, method="PUT", path=path)
 
     # --- Справочники -------------------------------------------------------
 
     async def list_offers(self) -> list[Offer]:
-        data = await self._request("GET", "/offers")
-        return [Offer.model_validate(item) for item in data or []]
+        path = "/offers"
+        data = await self._request("GET", path)
+        return _parse_list(Offer, data, method="GET", path=path)
 
     async def get_offer(self, offer_id: int) -> Offer:
-        data = await self._request("GET", f"/offers/{offer_id}")
-        return Offer.model_validate(data or {})
+        path = f"/offers/{offer_id}"
+        data = await self._request("GET", path)
+        return _parse_model(Offer, data, method="GET", path=path)
 
     async def list_domains(self) -> list[Domain]:
-        data = await self._request("GET", "/domains")
-        return [Domain.model_validate(item) for item in data or []]
+        path = "/domains"
+        data = await self._request("GET", path)
+        return _parse_list(Domain, data, method="GET", path=path)
 
     async def list_groups(self, group_type: GroupType = "campaigns") -> list[Group]:
         """`type` обязателен: без него живой инстанс отвечает 400."""
-        data = await self._request("GET", "/groups", params={"type": group_type})
-        return [Group.model_validate(item) for item in data or []]
+        path = "/groups"
+        data = await self._request("GET", path, params={"type": group_type})
+        return _parse_list(Group, data, method="GET", path=path)
 
     async def list_traffic_sources(self) -> list[TrafficSource]:
-        data = await self._request("GET", "/traffic_sources")
-        return [TrafficSource.model_validate(item) for item in data or []]
+        path = "/traffic_sources"
+        data = await self._request("GET", path)
+        return _parse_list(TrafficSource, data, method="GET", path=path)
 
     # --- Отчёты ------------------------------------------------------------
 
     async def build_report(self, payload: ReportRequest) -> ReportResponse:
         """«Верные цифры»: клики и конверсии по кампаниям/потокам/офферам."""
-        data = await self._request("POST", "/report/build", body=payload.model_dump())
-        return ReportResponse.model_validate(data or {})
+        path = "/report/build"
+        data = await self._request("POST", path, body=payload.model_dump())
+        return _parse_model(ReportResponse, data, method="POST", path=path)

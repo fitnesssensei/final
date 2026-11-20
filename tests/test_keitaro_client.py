@@ -11,6 +11,7 @@ from keitaro_wrapper.keitaro import (
     CampaignCreate,
     KeitaroAuthError,
     KeitaroClient,
+    KeitaroError,
     KeitaroNotFound,
     KeitaroUnavailable,
     KeitaroValidationError,
@@ -76,6 +77,17 @@ async def test_get_campaign_sends_api_key_and_parses(keitaro: KeitaroClient) -> 
     request = route.calls.last.request
     assert request.headers["Api-Key"] == "test-key"
     assert str(request.url) == f"{API}/campaigns/42"
+
+
+@respx.mock
+async def test_api_key_is_stripped_before_sending() -> None:
+    """Клиент — самостоятельный слой: ключ из скрипта с пробелами не должен давать 401."""
+    route = respx.get(f"{API}/campaigns").mock(return_value=httpx.Response(200, json=[]))
+    client = KeitaroClient(API, "  key-with-spaces  ")
+    async with client:
+        await client.list_campaigns()
+
+    assert route.calls.last.request.headers["Api-Key"] == "key-with-spaces"
 
 
 @respx.mock
@@ -317,6 +329,78 @@ async def test_plain_text_error_is_preserved(keitaro: KeitaroClient) -> None:
         await keitaro.list_campaigns()
 
     assert "Param 'type' is required" in str(exc_info.value)
+
+
+@respx.mock
+async def test_non_json_success_body_raises_error(keitaro: KeitaroClient) -> None:
+    """200 с HTML — заглушка Cloudflare или неверный KEITARO_BASE_URL, а не «данных нет»."""
+    respx.get(f"{API}/campaigns").mock(
+        return_value=httpx.Response(200, text="<html><body>maintenance</body></html>")
+    )
+
+    with pytest.raises(KeitaroError) as exc_info:
+        await keitaro.list_campaigns()
+
+    message = str(exc_info.value)
+    assert "ответ не JSON" in message
+    assert "maintenance" in message
+    assert exc_info.value.path == "/campaigns"
+
+
+@respx.mock
+async def test_non_json_error_body_still_maps_by_status(
+    keitaro: KeitaroClient, sleeps: list[float]
+) -> None:
+    """HTML на 502 — по-прежнему KeitaroUnavailable: для ошибок разбор JSON не обязателен."""
+    respx.get(f"{API}/campaigns").mock(
+        return_value=httpx.Response(502, text="<html>Bad gateway</html>")
+    )
+
+    with pytest.raises(KeitaroUnavailable) as exc_info:
+        await keitaro.list_campaigns()
+
+    assert exc_info.value.status == 502
+    assert "Bad gateway" in str(exc_info.value)
+    assert sleeps == [0.5, 1.0]
+
+
+@respx.mock
+async def test_dict_instead_of_list_raises_domain_error(keitaro: KeitaroClient) -> None:
+    """Объект вместо списка — доменная ошибка с путём, а не pydantic ValidationError."""
+    respx.get(f"{API}/campaigns").mock(return_value=httpx.Response(200, json={"id": 42}))
+
+    with pytest.raises(KeitaroError) as exc_info:
+        await keitaro.list_campaigns()
+
+    assert "список" in str(exc_info.value)
+    assert exc_info.value.path == "/campaigns"
+
+
+@respx.mock
+async def test_list_item_with_wrong_shape_raises_domain_error(keitaro: KeitaroClient) -> None:
+    """Ошибка валидации элемента должна показывать, какое поле не пришло."""
+    respx.get(f"{API}/campaigns").mock(
+        return_value=httpx.Response(200, json=[{"name": "без id и alias"}])
+    )
+
+    with pytest.raises(KeitaroError) as exc_info:
+        await keitaro.list_campaigns()
+
+    message = str(exc_info.value)
+    assert "неверный формат" in message
+    assert "id" in message
+
+
+@respx.mock
+async def test_list_instead_of_object_raises_domain_error(keitaro: KeitaroClient) -> None:
+    """Для одиночной сущности список — тоже неверный формат."""
+    respx.get(f"{API}/offers/999").mock(return_value=httpx.Response(200, json=[]))
+
+    with pytest.raises(KeitaroError) as exc_info:
+        await keitaro.get_offer(999)
+
+    assert "объект" in str(exc_info.value)
+    assert exc_info.value.path == "/offers/999"
 
 
 @respx.mock
