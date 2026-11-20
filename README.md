@@ -16,9 +16,9 @@
 |---|---|
 | Разведка Admin API, дамп инстанса, контракт создания кампании | готово |
 | Скелет приложения, `/health`, настройки, Docker, тесты | готово |
-| Клиент Keitaro с обработкой ошибок и ретраями | следующий шаг |
-| Таблицы и миграции Alembic | запланировано |
-| `POST /api/campaigns` (создаватель) | запланировано |
+| Клиент Keitaro с обработкой ошибок и ретраями | готово |
+| Таблицы, журнал операций и миграции Alembic | готово |
+| `POST /api/campaigns` (создаватель) | следующий шаг |
 | `GET/PUT /api/campaigns/{id}` (редактор) | запланировано |
 | UI создаватора и редактора | запланировано |
 
@@ -36,8 +36,14 @@
 ```bash
 cp .env.example .env      # и заполнить: ключ и адрес Keitaro
 make install              # uv sync
+docker compose up -d db   # PostgreSQL для миграций и журнала операций
+make migrate              # alembic upgrade head
 make run                  # http://127.0.0.1:8000
 ```
+
+`make run` без Postgres тоже работает для `/health`, но ручки, которые пишут
+журнал операций (шаги 4–5), без миграций вернут 503 с подсказкой
+«выполните make migrate» — сначала `make migrate`.
 
 Проверка:
 
@@ -57,6 +63,9 @@ healthcheck.
 ## Запуск в Docker
 
 ```bash
+docker compose build app
+docker compose up -d db
+docker compose run --rm app alembic upgrade head   # миграции до старта приложения
 make up        # app + PostgreSQL (порт хоста 5433, чтобы не мешать локальному Postgres)
 make logs
 make down
@@ -75,10 +84,12 @@ make test      # uv run pytest -q
 make lint      # uv run ruff check .
 ```
 
-Тесты не ходят в сеть и не трогают БД: запросы идут через ASGI-транспорт внутри
-процесса, настройки поднимаются в изолированном окружении (`tests/conftest.py`
-гасит `KEITARO_*` и сбрасывает кэш настроек). Моки Keitaro (`respx`) и SQLite
-в памяти появятся вместе с клиентом и моделями — пока их не к чему применять.
+Тесты не ходят в сеть: ответы Keitaro замоканы `respx`, а БД — файл SQLite во
+временном каталоге `tmp_path` (Postgres для тестов не нужен). Настройки
+поднимаются в изолированном окружении (`tests/conftest.py` гасит `KEITARO_*`
+и сбрасывает кэш). Отдельный тест прогоняет `alembic upgrade head` → `downgrade
+base` на SQLite и сверяет таблицы и колонки с моделями, чтобы миграция не
+разошлась со схемой.
 
 ## Конфигурация
 
@@ -93,6 +104,8 @@ make lint      # uv run ruff check .
 | `KEITARO_GROUP_ID` | да | группа кампаний по умолчанию |
 | `KEITARO_SOURCE_ID` | да | источник трафика по умолчанию |
 | `KEITARO_GOOGLE_URL` | нет | редирект гео-потока, по умолчанию `https://www.google.com` |
+| `KEITARO_TIMEOUT` | нет | таймаут одного запроса в секундах, по умолчанию `10` (было 30 — веб-ручка ждала слишком долго) |
+| `KEITARO_RETRIES` | нет | число повторов сверх первой попытки, по умолчанию `1` (допустимо 0–5) |
 | `DATABASE_URL` | нет | строка подключения SQLAlchemy, по умолчанию локальный Postgres на 5433 |
 | `LOG_LEVEL` | нет | `critical`…`debug`, по умолчанию `info`; применяется к логированию приложения |
 
@@ -121,14 +134,34 @@ src/keitaro_wrapper/
   logging_setup.py  применение LOG_LEVEL
   api/router.py     корневой роутер
   api/routes/       эндпоинты
+  keitaro/          клиент Admin API, DTO и доменные ошибки
+  db/               модели, сессии, журнал операций, кэш справочников
+migrations/         env.py и версии миграций Alembic
 tests/              pytest
 ```
 
-Слои, которые появятся дальше: `services` (создаватель, редактор) →
-`keitaro` (клиент, DTO, ошибки) → `repositories` + `models`.
+Слои, которые появятся дальше: `services` (создаватель, редактор) поверх
+`keitaro` и `db`.
 
 ## Миграции
 
-Появятся вместе с таблицами на шаге 3. Пока `make migrate` — заглушка: печатает
-объяснение и выходит с кодом 1, чтобы пустой прогон нельзя было принять за
-успешную миграцию. До этого приложению БД не нужна: `/health` работает без неё.
+```bash
+make migrate        # uv run alembic upgrade head
+make migrate-down   # откат последней миграции
+```
+
+URL берётся из `DATABASE_URL`/`.env`, дефолт — Postgres из compose. Ключи
+Keitaro для миграций не нужны: `migrations/env.py` не требует `KEITARO_API_KEY`.
+В Docker миграции запускаются отдельной командой (файлы `alembic.ini` и
+`migrations/` включены в образ):
+
+```bash
+docker compose run --rm app alembic upgrade head
+```
+
+Приложение не мигрирует БД само и не проверяет соединение на старте: движок
+ленивый, поэтому `/health` и чтение Keitaro работают и без Postgres. Если схема
+не накатана или БД недоступна, ручки с журналом отвечают **503** с текстом
+«Локальная база не готова: выполните `make migrate` …» (`OperationalError`,
+`ProgrammingError`, `ConnectionError` и таймаут пула перехватываются в
+`api/errors.py`), а подробности попадают в лог приложения.

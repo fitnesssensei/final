@@ -9,6 +9,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Хосты, для которых допустим http://: локальный мок Keitaro и отладка на своей машине
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# Дефолт совпадает с docker-compose (порт 5433, чтобы не конфликтовать с локальным Postgres).
+# Константа нужна и Alembic: миграции не должны требовать KEITARO_API_KEY, поэтому
+# env.py берёт значение отсюда, а не инстанцирует полный Settings.
+DEFAULT_DATABASE_URL = "postgresql+asyncpg://keitaro:keitaro@localhost:5433/keitaro_wrapper"
+
 
 class Settings(BaseSettings):
     """Конфигурация инстанса Keitaro и локальной БД.
@@ -31,8 +36,13 @@ class Settings(BaseSettings):
     keitaro_group_id: int = Field(gt=0)
     keitaro_source_id: int = Field(gt=0)
     keitaro_google_url: HttpUrl = HttpUrl("https://www.google.com")
+    # Таймауты под веб-ручку: 10 с вместо 30, иначе зависший Keitaro держит
+    # воркер до 90 с (30 с × 3 попытки + паузы). Для долгих вызовов (создание
+    # кампании) значение поднимается через .env.
+    keitaro_timeout: float = Field(default=10.0, gt=0, le=300)
+    keitaro_retries: int = Field(default=1, ge=0, le=5)
 
-    database_url: str = "postgresql+asyncpg://keitaro:keitaro@localhost:5433/keitaro_wrapper"
+    database_url: str = DEFAULT_DATABASE_URL
     log_level: Literal["critical", "error", "warning", "info", "debug"] = "info"
 
     @field_validator("keitaro_api_key", mode="before")

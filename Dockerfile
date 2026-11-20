@@ -19,6 +19,11 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY src ./src
 RUN uv sync --frozen --no-dev
 
+# Скрипт миграций и модели лежат вне wheel — кладём их в образ,
+# чтобы `docker compose run --rm app alembic upgrade head` работал.
+COPY alembic.ini ./
+COPY migrations ./migrations
+
 RUN useradd --create-home --uid 1000 app && chown -R app:app /app
 USER app
 

@@ -1,4 +1,4 @@
-.PHONY: install run test lint format migrate up down logs
+.PHONY: install run test lint format migrate migrate-down up down logs
 
 install:
 	uv sync
@@ -16,9 +16,10 @@ format:
 	uv run ruff format .
 
 migrate:
-	@echo "Миграций пока нет: таблицы и Alembic появятся на шаге 3." >&2
-	@echo "До этого приложению БД не нужна, alembic.ini в проекте отсутствует." >&2
-	@exit 1
+	uv run alembic upgrade head
+
+migrate-down:
+	uv run alembic downgrade -1
 
 up:
 	docker compose up --build

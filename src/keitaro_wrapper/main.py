@@ -8,8 +8,10 @@ from fastapi import FastAPI
 from pydantic import ValidationError
 
 from keitaro_wrapper import __version__
+from keitaro_wrapper.api.errors import register_exception_handlers
 from keitaro_wrapper.api.router import api_router
 from keitaro_wrapper.config import get_settings
+from keitaro_wrapper.db import create_engine, create_session_factory
 from keitaro_wrapper.keitaro import KeitaroClient
 from keitaro_wrapper.logging_setup import configure_logging
 
@@ -34,14 +36,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     configure_logging(settings.log_level)
     # Клиент создаётся один раз на процесс: пул соединений живёт между запросами
-    client = KeitaroClient(settings.keitaro_api_root, settings.keitaro_api_key.get_secret_value())
+    client = KeitaroClient(
+        settings.keitaro_api_root,
+        settings.keitaro_api_key.get_secret_value(),
+        timeout=settings.keitaro_timeout,
+        retries=settings.keitaro_retries,
+    )
     app.state.keitaro = client
-    logger.info("Приложение запущено, Keitaro Admin API: %s", settings.keitaro_api_root)
+    # Движок ленивый: соединение с БД откроется на первом запросе к журналу,
+    # поэтому `/health` и чтение Keitaro работают и без поднятого Postgres.
+    engine = create_engine(settings.database_url)
+    app.state.engine = engine
+    app.state.session_factory = create_session_factory(engine)
+    logger.info(
+        "Приложение запущено, Keitaro Admin API: %s, БД: %s",
+        settings.keitaro_api_root,
+        engine.url.get_backend_name(),
+    )
     try:
         yield
     finally:
         # Закрываем соединения при штатной остановке и при падении старта
         await client.aclose()
+        await engine.dispose()
 
 
 def create_app() -> FastAPI:
@@ -53,6 +70,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.include_router(api_router)
+    register_exception_handlers(app)
     return app
 
 

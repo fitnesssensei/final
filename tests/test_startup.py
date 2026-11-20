@@ -7,8 +7,10 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from sqlalchemy import func, select, text
 
-from keitaro_wrapper.api.deps import get_keitaro_client
+from keitaro_wrapper.api.deps import get_keitaro_client, get_session
+from keitaro_wrapper.db import Base, OperationLog, OperationType
 from keitaro_wrapper.keitaro import KeitaroClient
 from keitaro_wrapper.logging_setup import configure_logging
 from keitaro_wrapper.main import create_app, lifespan
@@ -100,6 +102,66 @@ async def test_dependency_returns_client_from_app_state(monkeypatch: pytest.Monk
         request = SimpleNamespace(app=app)
 
         assert get_keitaro_client(request) is app.state.keitaro
+
+
+async def test_lifespan_creates_database_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Движок и фабрика сессий появляются на старте и работают."""
+    set_env(monkeypatch, DATABASE_URL="sqlite+aiosqlite:///:memory:")
+    app = create_app()
+
+    async with lifespan(app):
+        async with app.state.session_factory() as session:
+            assert (await session.execute(text("select 1"))).scalar() == 1
+        assert app.state.engine.url.get_backend_name() == "sqlite"
+
+
+async def test_session_dependency_rolls_back_on_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Исключение в ручке откатывает журнал: полстроки не остаётся."""
+    set_env(monkeypatch, DATABASE_URL="sqlite+aiosqlite:///:memory:")
+    app = create_app()
+
+    async with lifespan(app):
+        async with app.state.engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+
+        generator = get_session(SimpleNamespace(app=app))
+        session = await anext(generator)
+        session.add(
+            OperationLog(
+                idempotency_key="rollback-me",
+                operation_type=OperationType.CAMPAIGN_CREATE.value,
+                payload={"probe": True},
+            )
+        )
+        await session.flush()
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await generator.athrow(RuntimeError("boom"))
+
+        async with app.state.session_factory() as check:
+            count = await check.scalar(select(func.count()).select_from(OperationLog))
+        assert count == 0
+
+
+async def test_lifespan_passes_timeout_and_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    """C2: значения из настроек доходят до клиента, а не остаются дефолтами класса."""
+    set_env(monkeypatch, KEITARO_TIMEOUT="7.5", KEITARO_RETRIES="3")
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr("keitaro_wrapper.main.KeitaroClient", FakeClient)
+    app = create_app()
+
+    async with lifespan(app):
+        pass
+
+    assert captured == {"timeout": 7.5, "retries": 3}
 
 
 def test_configure_logging_applies_level() -> None:

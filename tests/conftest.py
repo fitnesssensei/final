@@ -2,11 +2,14 @@
 
 import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import httpx
 import pytest
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from keitaro_wrapper.config import Settings, get_settings
+from keitaro_wrapper.db import Base, create_session_factory
 from keitaro_wrapper.main import create_app
 
 
@@ -20,6 +23,28 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     transport = httpx.ASGITransport(app=create_app())
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http_client:
         yield http_client
+
+
+@pytest.fixture
+async def db_engine(tmp_path: Path) -> AsyncIterator[AsyncEngine]:
+    """Файловая SQLite на каждый тест: `:memory:` не пережил бы переподключение пула.
+
+    Схема создаётся `create_all` — миграции проверяются отдельным тестом,
+    чтобы падение Alembic не маскировало тесты репозиториев.
+    """
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def session(db_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """Сессия поверх тестовой БД; закрывается после теста."""
+    factory = create_session_factory(db_engine)
+    async with factory() as db_session:
+        yield db_session
 
 
 @pytest.fixture(autouse=True)

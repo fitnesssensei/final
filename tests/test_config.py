@@ -80,6 +80,30 @@ def test_default_google_url_and_database_url() -> None:
     assert settings.keitaro_api_root == "https://tlgk.host/admin_api/v1"
 
 
+def test_default_timeout_and_retries() -> None:
+    """Дефолты рассчитаны на веб-ручку: 10 с и один ретрай, а не 30 с × 3."""
+    settings = make_settings()
+
+    assert settings.keitaro_timeout == 10.0
+    assert settings.keitaro_retries == 1
+
+
+@pytest.mark.parametrize("timeout", [0, -1, 301])
+def test_invalid_timeout_is_rejected(timeout: float) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(keitaro_timeout=timeout)
+
+    assert [err["loc"] for err in exc_info.value.errors()] == [("keitaro_timeout",)]
+
+
+@pytest.mark.parametrize("retries", [-1, 6])
+def test_invalid_retries_is_rejected(retries: int) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(keitaro_retries=retries)
+
+    assert [err["loc"] for err in exc_info.value.errors()] == [("keitaro_retries",)]
+
+
 def test_empty_api_key_is_rejected() -> None:
     """Пустой ключ из `.env` — ошибка на старте, а не 401 на первом запросе к Keitaro."""
     with pytest.raises(ValidationError) as exc_info:
