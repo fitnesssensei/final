@@ -1,12 +1,15 @@
 """Настройки приложения: читаются из окружения и `.env`."""
 
 from functools import lru_cache
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOG_LEVELS = {"critical", "error", "warning", "info", "debug"}
+
+# Хосты, для которых допустим http://: локальный мок Keitaro и отладка на своей машине
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
 class Settings(BaseSettings):
@@ -23,7 +26,9 @@ class Settings(BaseSettings):
     )
 
     keitaro_base_url: HttpUrl
-    keitaro_api_key: SecretStr
+    # min_length=1 — пустой KEITARO_API_KEY= из .env отсекается на старте,
+    # иначе приложение поднимается и падает с 401 на первом запросе к Keitaro
+    keitaro_api_key: Annotated[SecretStr, Field(min_length=1)]
     keitaro_domain_id: int = Field(gt=0)
     keitaro_group_id: int = Field(gt=0)
     keitaro_source_id: int = Field(gt=0)
@@ -31,6 +36,35 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://keitaro:keitaro@localhost:5433/keitaro_wrapper"
     log_level: Literal["critical", "error", "warning", "info", "debug"] = "info"
+
+    @field_validator("keitaro_api_key", mode="before")
+    @classmethod
+    def _strip_api_key(cls, value: object) -> object:
+        """Убирает пробелы и переводы строк по краям ключа.
+
+        Без этого значение `KEITARO_API_KEY="   "` проходило бы `min_length=1`
+        и попадало в заголовок `Api-Key` с пробелами — Keitaro ответил бы 401.
+        """
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator("keitaro_base_url")
+    @classmethod
+    def _require_https(cls, value: HttpUrl) -> HttpUrl:
+        """Запрещает http:// для боевого инстанса: ключ Api-Key шёл бы открытым текстом.
+
+        Исключение — loopback-хосты: локальный мок Keitaro и отладка на своей
+        машине, где трафик не покидает хост.
+        """
+        # HttpUrl отдаёт IPv6-хост в скобках ('[::1]'), поэтому скобки убираем
+        host = (value.host or "").strip("[]")
+        if value.scheme != "https" and host not in LOOPBACK_HOSTS:
+            raise ValueError(
+                "KEITARO_BASE_URL должен начинаться с https:// — по http ключ Api-Key "
+                "передаётся открытым текстом"
+            )
+        return value
 
     @field_validator("keitaro_base_url", "keitaro_google_url")
     @classmethod
