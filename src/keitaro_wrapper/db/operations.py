@@ -4,14 +4,18 @@
 операцию, создаёт кампанию и записывает внешний id. Повтор с тем же ключом
 (двойной клик, ретрай прокси) получает ту же строку журнала и не создаёт
 вторую кампанию.
+
+Здесь же обслуживание журнала: строки старше `OPERATIONS_RETENTION_DAYS`
+удаляются на старте приложения, иначе таблица растёт бесконечно.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +54,25 @@ async def find_operation(session: AsyncSession, idempotency_key: str) -> Operati
     return await session.scalar(
         select(OperationLog).where(OperationLog.idempotency_key == _normalize_key(idempotency_key))
     )
+
+
+async def prune_operations(session: AsyncSession, *, older_than_days: int) -> int:
+    """Удаляет записи журнала старше `older_than_days` дней и коммитит.
+
+    Возвращает число удалённых строк. `0` дней означает «не чистить»: иначе
+    настройка по умолчанию стирала бы журнал, который гарантирует
+    идемпотентность повторов (клиент может повторить запрос и через месяц).
+
+    Дата считается в UTC: `created_at` пишет сервер (`now()`), поэтому
+    сравнение идёт с текущим моментом UTC, а не с локальным временем процесса.
+    """
+    if older_than_days <= 0:
+        return 0
+    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+    result = await session.execute(delete(OperationLog).where(OperationLog.created_at < cutoff))
+    await session.commit()
+    # rowcount у asyncpg/aiosqlite отдаёт число строк; None трактуем как «неизвестно»
+    return int(result.rowcount or 0)
 
 
 async def claim_operation(

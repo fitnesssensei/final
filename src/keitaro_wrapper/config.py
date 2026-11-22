@@ -1,9 +1,9 @@
 """Настройки приложения: читаются из окружения и `.env`."""
 
 from functools import lru_cache
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field, HttpUrl, SecretStr, field_validator
+from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Хосты, для которых допустим http://: локальный мок Keitaro и отладка на своей машине
@@ -46,6 +46,21 @@ class Settings(BaseSettings):
     database_url: str = DEFAULT_DATABASE_URL
     log_level: Literal["critical", "error", "warning", "info", "debug"] = "info"
 
+    # --- Доступ к API и интерфейсу (необязательно) -------------------------------
+    # HTTP Basic для /api/* и /ui/*. Пустая пара — авторизация выключена
+    # (дефолт: локальный инструмент). Половина пары — ошибка настройки:
+    # «почти включённая» авторизация опаснее её отсутствия.
+    auth_user: str | None = None
+    auth_password: SecretStr | None = None
+
+    # --- Локальная БД: свежесть кэша и срок жизни журнала ------------------------
+    # Сколько секунд справочники (кампании, офферы, домены…) считаются свежими.
+    # 0 — TTL выключен: кэш обновляется только когда он пуст или явно (?refresh=1).
+    reference_cache_ttl: int = Field(default=900, ge=0, le=86400)
+    # Записи журнала операций старше N дней удаляются на старте приложения.
+    # 0 — не удалять (журнал растёт бесконечно).
+    operations_retention_days: int = Field(default=7, ge=0, le=3650)
+
     @field_validator("keitaro_api_key", mode="before")
     @classmethod
     def _strip_api_key(cls, value: object) -> object:
@@ -82,6 +97,25 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return value.strip().lower()
         return value
+
+    @field_validator("auth_user", "auth_password", mode="before")
+    @classmethod
+    def _empty_auth_means_disabled(cls, value: object) -> object:
+        """`AUTH_USER=` в `.env` — это «выключено», а не пустой логин.
+
+        Без нормализации пустая строка принималась бы как валидное значение,
+        и авторизация включалась бы с пустым именем — то есть не защищала бы.
+        """
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @model_validator(mode="after")
+    def _auth_pair_is_complete(self) -> Self:
+        """Логин и пароль задаются только вместе: половина пары — ошибка старта."""
+        if (self.auth_user is None) != (self.auth_password is None):
+            raise ValueError("AUTH_USER и AUTH_PASSWORD задаются вместе или не задаются вовсе")
+        return self
 
     @property
     def keitaro_api_root(self) -> str:

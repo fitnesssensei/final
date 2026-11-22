@@ -42,7 +42,22 @@ services:
       ]
     ports:
       - "8000:8000"
-    # HEALTHCHECK наследуется из Dockerfile (GET http://127.0.0.1:8000/health)
+    # Readiness вместо liveness из Dockerfile: контейнер считается здоровым
+    # только когда отвечает база (иначе журнал операций писать некуда).
+    # Пока миграции не накатаны, `docker compose ps` честно покажет unhealthy —
+    # лечится командой из README: `docker compose run --rm app alembic upgrade head`.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
     depends_on:
       db:
         condition: service_healthy

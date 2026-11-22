@@ -88,6 +88,34 @@ def test_default_timeout_and_retries() -> None:
     assert settings.keitaro_retries == 1
 
 
+def test_maintenance_and_auth_defaults() -> None:
+    """Обслуживание БД включено по умолчанию, авторизация — нет (локальный инструмент)."""
+    settings = make_settings()
+
+    assert settings.reference_cache_ttl == 900
+    assert settings.operations_retention_days == 7
+    assert settings.auth_user is None
+    assert settings.auth_password is None
+
+
+@pytest.mark.parametrize("value", [-1, 86401])
+def test_invalid_cache_ttl_is_rejected(value: int) -> None:
+    """Отрицательный TTL и больше суток — ошибка настроек, а не молчаливый дефолт."""
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(reference_cache_ttl=value)
+
+    assert [err["loc"] for err in exc_info.value.errors()] == [("reference_cache_ttl",)]
+
+
+@pytest.mark.parametrize("value", [-1, 3651])
+def test_invalid_retention_days_is_rejected(value: int) -> None:
+    """Срок хранения журнала ограничен 0–3650 днями: опечатка не должна стереть журнал."""
+    with pytest.raises(ValidationError) as exc_info:
+        make_settings(operations_retention_days=value)
+
+    assert [err["loc"] for err in exc_info.value.errors()] == [("operations_retention_days",)]
+
+
 @pytest.mark.parametrize("timeout", [0, -1, 301])
 def test_invalid_timeout_is_rejected(timeout: float) -> None:
     with pytest.raises(ValidationError) as exc_info:

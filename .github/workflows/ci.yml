@@ -1,0 +1,58 @@
+name: CI
+
+# Прогон на каждый push в main и на каждый pull request: линтер, формат,
+# тесты и миграции. Keitaro в CI не нужен — все тесты герметичные (двойник).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    # Настоящий Postgres, чтобы миграции проверялись на том же движке, что в проде:
+    # SQLite не поймал бы ошибки DDL (типы, ограничения, порядок ревизий).
+    services:
+      db:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: keitaro
+          POSTGRES_PASSWORD: keitaro
+          POSTGRES_DB: keitaro_wrapper
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keitaro -d keitaro_wrapper"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Тот же asyncpg-драйвер, что в .env.example, только порт стандартный
+      DATABASE_URL: postgresql+asyncpg://keitaro:keitaro@localhost:5432/keitaro_wrapper
+    steps:
+      - uses: actions/checkout@v4
+      # uv версии из Dockerfile: локальный и CI-прогоны используют один резолвер
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.12"
+          python-version: "3.13"
+          enable-cache: true
+      # --frozen: версии строго из uv.lock, без неявных обновлений
+      - name: Установить зависимости
+        run: uv sync --frozen
+      - name: Линтер
+        run: uv run ruff check .
+      - name: Формат
+        run: uv run ruff format --check .
+      - name: Тесты
+        run: uv run pytest -q
+      # Миграции проверяются отдельно от тестов: приложение их само не накатывает
+      - name: Миграции вверх
+        run: uv run alembic upgrade head
+      - name: Нет расхождений моделей и миграций
+        run: uv run alembic check
+      # Откат до пустой базы и повторный накат: downgrade не должен падать
+      - name: Миграции вниз и снова вверх
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head

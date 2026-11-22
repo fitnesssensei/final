@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from keitaro_wrapper.config import Settings, get_settings
 from keitaro_wrapper.db import Base, create_session_factory
 from keitaro_wrapper.main import create_app
+from keitaro_wrapper.services import reference
 
 
 @pytest.fixture
@@ -77,6 +78,21 @@ def _reset_settings_cache() -> Iterator[None]:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_reference_cache() -> Iterator[None]:
+    """Сбрасывает TTL справочников и отметки обновления до и после теста.
+
+    TTL — состояние процесса (`services/reference.py`), а не запроса: без сброса
+    тест «кэш не обновляется внутри TTL» зависел бы от порядка файлов и падал
+    бы после теста, включившего TTL через `lifespan`.
+    """
+    reference.configure_cache_ttl(0)
+    reference.reset_cache_state()
+    yield
+    reference.configure_cache_ttl(0)
+    reference.reset_cache_state()
 
 
 @pytest.fixture(autouse=True)
