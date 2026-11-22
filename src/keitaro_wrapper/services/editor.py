@@ -124,11 +124,18 @@ class CampaignDetail(BaseModel):
 
 
 class AddOfferRequest(BaseModel):
-    """Тело `POST /api/campaigns/{id}/offers`."""
+    """Тело `POST /api/campaigns/{id}/offers`.
+
+    `stream_id` — поток, в который добавляется оффер: у кампании бывает
+    несколько потоков с офферами, и добавление «куда-нибудь» попадало бы не в
+    тот поток. Без `stream_id` поток выбирается правилом `_offer_stream`
+    (совместимость с прежним поведением API).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     offer_id: int = Field(gt=0)
+    stream_id: int | None = Field(default=None, gt=0)
 
 
 class OfferShare(BaseModel):
@@ -257,13 +264,22 @@ async def _offer_names(
 
 async def _report_stats(
     client: KeitaroClient, campaign_id: int, interval: ReportInterval
-) -> tuple[dict[str, _Counters], _Counters, bool]:
-    """Клики/конверсии по офферам кампании из `POST /report/build`.
+) -> tuple[dict[tuple[int, int], _Counters], _Counters, bool]:
+    """Клики/конверсии по паре (поток, оффер) из `POST /report/build`.
 
-    Отчёт умеет измерение `campaign_id` (проверено на живом инстансе), поэтому
-    строки фильтруются по id, а не по имени: одинаковые названия кампаний и
-    переименование не смешивают цифры. Агрегация внутри кампании — по имени
-    оффера, потому что отчёт отдаёт имена, а не id.
+    Измерения `campaign_id`, `stream_id`, `offer_id` проверены на живом
+    инстансе 21.11.2026: строки приходят по потокам, `offer_id = 0` — клики,
+    ушедшие не на оффер. Поэтому цифры привязываются к потоку и id оффера:
+    одинаковые имена офферов не складываются, а один оффер в двух потоках
+    показывает свои числа в каждом потоке.
+
+    Отчёт сужается фильтром `campaign_id EQUALS <id>` (`FilterRequest` из
+    спецификации), а строки дополнительно сверяются по `campaign_id`: чужая
+    кампания в цифры не попадёт, даже если фильтр проигнорирован.
+
+    Если трекер вернул строки, но ни в одной нет `campaign_id`, показывать нули
+    нельзя: это выглядело бы как «трафика нет». Тогда `stats_available=false` и
+    предупреждение в лог — редактор честно скажет, что цифры недоступны.
 
     Сбой отчёта не ломает редактор: цифры нулевые, `stats_available=false`,
     причина остаётся в логе.
@@ -271,24 +287,36 @@ async def _report_stats(
     try:
         report = await client.build_report(
             ReportRequest(
-                dimensions=["campaign_id", "offer"],
+                dimensions=["campaign_id", "stream_id", "offer_id"],
                 measures=["clicks", "conversions"],
                 range={"interval": interval},
+                filters=[{"name": "campaign_id", "operator": "EQUALS", "expression": campaign_id}],
             )
         )
     except KeitaroError as exc:
         logger.warning("отчёт Keitaro недоступен для кампании %s: %s", campaign_id, exc)
         return {}, _Counters(), False
 
-    by_offer: dict[str, _Counters] = {}
+    rows = [row for row in report.rows if row.campaign_id == campaign_id]
+    if report.rows and not rows:
+        # Строки есть, но ни одна не относится к кампании: измерение `campaign_id`
+        # трекер не вернул. Нули здесь были бы обманом, поэтому — баннер.
+        logger.warning(
+            "отчёт Keitaro не вернул campaign_id кампании %s: строк %s",
+            campaign_id,
+            len(report.rows),
+        )
+        return {}, _Counters(), False
+
+    by_offer: dict[tuple[int, int], _Counters] = {}
     totals = _Counters()
-    for row in report.rows:
-        if row.campaign_id != campaign_id:
-            continue
+    for row in rows:
         totals.clicks += row.clicks
         totals.conversions += row.conversions
-        if row.offer:
-            counters = by_offer.setdefault(row.offer, _Counters())
+        # Строка без потока или с `offer_id = 0` — клики не на оффер: они
+        # попадают только в итог кампании.
+        if row.stream_id and row.offer_id:
+            counters = by_offer.setdefault((row.stream_id, row.offer_id), _Counters())
             counters.clicks += row.clicks
             counters.conversions += row.conversions
     return by_offer, totals, True
@@ -317,7 +345,10 @@ async def get_campaign_detail(
         offers = []
         for offer in stream.offers:
             name = names.get(offer.offer_id)
-            counters = by_offer.get(name, _Counters()) if name else _Counters()
+            # Цифры привязаны к паре (поток, оффер): один и тот же оффер в двух
+            # потоках показывает свои числа в каждом, а одноимённые офферы не
+            # складываются.
+            counters = by_offer.get((stream.id, offer.offer_id), _Counters())
             offers.append(
                 OfferInStream(
                     offer_id=offer.offer_id,
@@ -376,17 +407,68 @@ async def _claim(
         raise RequestError(str(exc)) from exc
 
 
+def preferred_offer_stream[StreamT: (Stream, EditorStream)](
+    streams: Sequence[StreamT],
+) -> StreamT | None:
+    """Поток для работы с офферами по умолчанию.
+
+    Приоритет: непустой `default`-поток, затем единственный поток с офферами,
+    затем пустой `default` (добавлять больше некуда). `None` — потоков с
+    офферами несколько: действие нужно адресовать конкретному потоку
+    (`stream_id`), иначе оффер молча уйдёт не туда.
+
+    Пустой `default` стоит ниже потоков с офферами специально: раньше он был
+    первым, и добавление уходило в поток, которого пользователь не видел.
+    """
+    defaults_with_offers = sorted(
+        (stream for stream in streams if stream.type == "default" and stream.offers),
+        key=lambda stream: (stream.position or 0, stream.id),
+    )
+    if len(defaults_with_offers) == 1:
+        return defaults_with_offers[0]
+    with_offers = [stream for stream in streams if stream.offers]
+    if len(with_offers) == 1:
+        return with_offers[0]
+    if with_offers:
+        return None
+    defaults = sorted(
+        (stream for stream in streams if stream.type == "default"),
+        key=lambda stream: (stream.position or 0, stream.id),
+    )
+    return defaults[0] if defaults else None
+
+
+def suggested_offer_stream_id[StreamT: (Stream, EditorStream)](
+    streams: Sequence[StreamT],
+) -> int | None:
+    """Поток, который форма добавления предвыбирает.
+
+    Приоритет отличается от `preferred_offer_stream`: пустой `default`-поток
+    предвыбирать нельзя, иначе оффер уйдёт в поток, которого пользователь не
+    видит (ровно этот дефект ловил саб-агент 21.11.2026). Сначала непустой
+    `default`, затем единственный непустой поток, иначе `None` — выбор остаётся
+    человеку (в форме появляется пустой пункт «выберите поток»).
+    """
+    with_offers = [stream for stream in streams if stream.offers]
+    defaults = [stream for stream in with_offers if stream.type == "default"]
+    if len(defaults) == 1:
+        return defaults[0].id
+    if len(with_offers) == 1:
+        return with_offers[0].id
+    return None
+
+
 async def _offer_stream(
     client: KeitaroClient, campaign_id: int, *, stream_id: int | None = None
 ) -> Stream:
     """Поток, в котором редактор меняет офферы.
 
-    `stream_id` приходит из формы удаления: один и тот же оффер может стоять
-    в нескольких потоках, и действие адресуется конкретному потоку. Без него
-    приоритет — `default`-поток (его создаёт создаватор). На живом инстансе
-    встречаются кампании, где офферы лежат в `regular`-потоке: если поток с
-    офферами ровно один, работаем с ним, а при неоднозначности просим выбрать
-    поток в Keitaro — молча менять не тот поток хуже ошибки.
+    `stream_id` приходит из формы: один и тот же оффер может стоять в нескольких
+    потоках, и действие адресуется конкретному потоку. Без него работает правило
+    `preferred_offer_stream` (`default`-поток, иначе единственный поток с
+    офферами). На живом инстансе встречаются кампании, где офферы лежат в
+    `regular`-потоке: при неоднозначности просим выбрать поток — молча менять
+    не тот поток хуже ошибки.
     """
     streams = await client.list_campaign_streams(campaign_id)
     if stream_id is not None:
@@ -395,20 +477,12 @@ async def _offer_stream(
                 return stream
         # Поток могли удалить в Keitaro уже после открытия страницы.
         raise NotFound(f"в кампании {campaign_id} нет потока {stream_id}")
-    defaults = sorted(
-        (stream for stream in streams if stream.type == "default"),
-        key=lambda stream: (stream.position or 0, stream.id),
-    )
-    if defaults:
-        return defaults[0]
 
-    with_offers = [stream for stream in streams if stream.offers]
-    if len(with_offers) == 1:
-        return with_offers[0]
-    if with_offers:
-        raise RequestError(
-            "в кампании несколько потоков с офферами — выберите поток в Keitaro вручную"
-        )
+    stream = preferred_offer_stream(streams)
+    if stream is not None:
+        return stream
+    if any(candidate.offers for candidate in streams):
+        raise RequestError("в кампании несколько потоков с офферами — выберите поток")
     raise RequestError(f"в кампании {campaign_id} нет потока с офферами")
 
 
@@ -446,7 +520,13 @@ async def add_offer(
 ) -> OfferMutationResult:
     """Добавляет оффер в поток и пересчитывает веса так, чтобы сумма была 100."""
     key = make_key(idempotency_key)
-    payload = {"campaign_id": campaign_id, "offer_id": request.offer_id}
+    payload: dict[str, Any] = {"campaign_id": campaign_id, "offer_id": request.offer_id}
+    if request.stream_id is not None:
+        # Поток — часть тела операции: добавление в другой поток это другое
+        # действие, и повтор с тем же ключом не должен засчитываться как оно.
+        # Ключ добавляем только когда он известен: у записей журнала, сделанных
+        # до появления `stream_id`, поля нет, и их повтор совпадает по телу.
+        payload["stream_id"] = request.stream_id
     claim = await _claim(session, key=key, operation_type=OperationType.OFFER_ADD, payload=payload)
     if not claim.created:
         return replay(
@@ -462,7 +542,7 @@ async def add_offer(
     updated = False
     try:
         await require_active_offer(client, request.offer_id)
-        stream = await _offer_stream(client, campaign_id)
+        stream = await _offer_stream(client, campaign_id, stream_id=request.stream_id)
         if any(offer.offer_id == request.offer_id for offer in stream.offers):
             raise Conflict(f"оффер {request.offer_id} уже есть в потоке {stream.id}")
 

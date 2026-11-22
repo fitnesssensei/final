@@ -391,5 +391,6 @@ class KeitaroClient:
     async def build_report(self, payload: ReportRequest) -> ReportResponse:
         """«Верные цифры»: клики и конверсии по кампаниям/потокам/офферам."""
         path = "/report/build"
-        data = await self._request("POST", path, body=payload.model_dump())
+        # `exclude_none`: незаполненные поля (например, `filters`) не уходят в API
+        data = await self._request("POST", path, body=payload.model_dump(exclude_none=True))
         return _parse_model(ReportResponse, data, method="POST", path=path)

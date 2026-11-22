@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from keitaro_wrapper.keitaro import (
@@ -66,9 +67,24 @@ DEFAULT_STREAMS = [
     ),
 ]
 DEFAULT_REPORT_ROWS = [
-    ReportRow(campaign_id=CAMPAIGN_ID, offer=None, clicks=5, conversions=0),
-    ReportRow(campaign_id=CAMPAIGN_ID, offer="Peru", clicks=10, conversions=2),
-    ReportRow(campaign_id=999, offer="Peru", clicks=99, conversions=9),
+    # Клики не на оффер: `offer_id = 0`, свой поток — так их отдаёт живой Keitaro
+    ReportRow(campaign_id=CAMPAIGN_ID, stream_id=1, offer_id=0, clicks=5, conversions=0),
+    ReportRow(
+        campaign_id=CAMPAIGN_ID,
+        stream_id=2,
+        offer_id=OFFER_ID,
+        offer="Peru",
+        clicks=10,
+        conversions=2,
+    ),
+    ReportRow(
+        campaign_id=999,
+        stream_id=2,
+        offer_id=OFFER_ID,
+        offer="Peru",
+        clicks=99,
+        conversions=9,
+    ),
 ]
 
 
@@ -90,14 +106,18 @@ class StubKeitaro:
         fail_stage: str | None = None,
         compensate_fails: bool = False,
     ) -> None:
-        self.domains = [Domain(id=1813, name="example.com")] if domains is None else domains
-        self.groups = (
+        # Копируем всё входящее: общие DEFAULT_* объекты не должны меняться
+        # между тестами (изоляция не держится на аккуратности тестов).
+        self.domains = copy.deepcopy(
+            [Domain(id=1813, name="example.com")] if domains is None else domains
+        )
+        self.groups = copy.deepcopy(
             [Group(id=10332, name="Campaigns", type="campaigns")] if groups is None else groups
         )
-        self.traffic_sources = (
+        self.traffic_sources = copy.deepcopy(
             [TrafficSource(id=836, name="Google")] if traffic_sources is None else traffic_sources
         )
-        self.offers = (
+        self.offers = copy.deepcopy(
             {
                 OFFER_ID: Offer(id=OFFER_ID, name="Peru", country=["Peru"], state="active"),
                 SECOND_OFFER_ID: Offer(
@@ -110,8 +130,12 @@ class StubKeitaro:
         self.campaigns = [DEFAULT_CAMPAIGN] if campaigns is None else campaigns
         # Пустой список по умолчанию: создаватель проверяет, что Keitaro сам
         # завёл default-поток, только когда включён `auto_default_stream`.
-        self.streams = [] if streams is None else streams
-        self.report_rows = DEFAULT_REPORT_ROWS if report_rows is None else report_rows
+        # Пустой список по умолчанию: создаватель проверяет, что Keitaro сам
+        # завёл default-поток, только когда включён `auto_default_stream`.
+        self.streams = [] if streams is None else copy.deepcopy(streams)
+        self.report_rows = copy.deepcopy(
+            DEFAULT_REPORT_ROWS if report_rows is None else report_rows
+        )
         self.auto_default_stream = auto_default_stream
         self.report_fails = report_fails
         self.fail_stage = fail_stage

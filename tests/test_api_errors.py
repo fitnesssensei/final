@@ -7,10 +7,16 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from sqlalchemy import func, select
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import IntegrityError, PendingRollbackError, ProgrammingError
 
 from keitaro_wrapper.api.deps import SessionDep
-from keitaro_wrapper.api.errors import DATABASE_NOT_READY, handle_database_not_ready, keitaro_detail
+from keitaro_wrapper.api.errors import (
+    DATABASE_CONFLICT,
+    DATABASE_NOT_READY,
+    describe_user_error,
+    handle_database_not_ready,
+    keitaro_detail,
+)
 from keitaro_wrapper.db import OperationLog
 from keitaro_wrapper.keitaro import KeitaroNotFound, KeitaroValidationError
 from keitaro_wrapper.main import create_app, lifespan
@@ -72,6 +78,35 @@ async def test_connection_refused_returns_503(monkeypatch: pytest.MonkeyPatch) -
 
     assert response.status_code == 503
     assert response.json() == {"detail": DATABASE_NOT_READY}
+
+
+async def test_integrity_error_returns_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Конфликт записи в локальной БД — 503 с подсказкой, а не 500.
+
+    `IntegrityError` бывает внутри сценария (журнал операций, кэш справочников);
+    до этого обработчика клиент получал 500 без объяснения.
+    """
+    set_env(monkeypatch, DATABASE_URL="sqlite+aiosqlite:///:memory:")
+    app = create_app()
+
+    @app.get("/conflict-db")
+    async def conflict_db() -> None:
+        raise IntegrityError("INSERT INTO operation_log", {}, Exception("UNIQUE constraint"))
+
+    async with lifespan(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/conflict-db")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": DATABASE_CONFLICT}
+
+
+def test_pending_rollback_is_described_for_ui() -> None:
+    """`PendingRollbackError` в UI-ручке: 503 с понятным текстом, не 500."""
+    error = PendingRollbackError("This session is in a failed transaction")
+
+    assert describe_user_error(error) == (503, DATABASE_CONFLICT)
 
 
 async def test_programming_error_does_not_leak_sql() -> None:

@@ -16,7 +16,7 @@ import re
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackError, ProgrammingError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from keitaro_wrapper.keitaro.errors import (
@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 DATABASE_NOT_READY = (
     "Локальная база не готова: выполните `make migrate` (alembic upgrade head) "
     "и проверьте DATABASE_URL"
+)
+# Конфликт записи (IntegrityError) и сессия в прерванной транзакции
+# (PendingRollbackError) — это состояние локальной БД, а не баг сценария:
+# клиенту нужен повтор, а не 500 «что-то сломалось».
+DATABASE_CONFLICT = (
+    "Локальная база отклонила запись — повторите действие; если повторяется, "
+    "посмотрите журнал приложения"
 )
 KEITARO_UNAVAILABLE = "Keitaro недоступен — повторите запрос позже"
 KEITARO_AUTH = "Keitaro отклонил ключ API — проверьте KEITARO_API_KEY и права ключа"
@@ -52,6 +59,17 @@ async def handle_database_not_ready(request: Request, exc: Exception) -> JSONRes
     """
     logger.error("БД не готова (%s %s): %s", request.method, request.url.path, exc)
     return JSONResponse(status_code=503, content={"detail": DATABASE_NOT_READY})
+
+
+async def handle_database_conflict(request: Request, exc: Exception) -> JSONResponse:
+    """503 на конфликт записи и прерванную транзакцию: клиенту нужен повтор.
+
+    `PendingRollbackError` возникает, когда предыдущее исключение уже прервало
+    транзакцию, а код попытался писать в неё ещё раз (например, отметка об
+    ошибке в журнале). Без этого обработчика клиент получал 500 без подсказки.
+    """
+    logger.error("БД отклонила запись (%s %s): %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=503, content={"detail": DATABASE_CONFLICT})
 
 
 def keitaro_status(exc: KeitaroError) -> int:
@@ -118,6 +136,8 @@ def describe_user_error(exc: Exception) -> tuple[int, str] | None:
         return exc.status_code, str(exc)
     if isinstance(exc, (OperationalError, ProgrammingError, PoolTimeoutError, ConnectionError)):
         return 503, DATABASE_NOT_READY
+    if isinstance(exc, (IntegrityError, PendingRollbackError)):
+        return 503, DATABASE_CONFLICT
     return None
 
 
@@ -151,6 +171,8 @@ def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(ProgrammingError, handle_database_not_ready)
     app.add_exception_handler(PoolTimeoutError, handle_database_not_ready)
     app.add_exception_handler(ConnectionError, handle_database_not_ready)
+    app.add_exception_handler(IntegrityError, handle_database_conflict)
+    app.add_exception_handler(PendingRollbackError, handle_database_conflict)
     # Starlette ищет обработчик по MRO, поэтому базовых классов достаточно
     app.add_exception_handler(KeitaroError, handle_keitaro_error)
     app.add_exception_handler(ServiceError, handle_service_error)

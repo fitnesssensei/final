@@ -35,6 +35,7 @@ from keitaro_wrapper.services.editor import (
     add_offer,
     get_campaign_detail,
     remove_offer,
+    suggested_offer_stream_id,
 )
 from keitaro_wrapper.services.reference import (
     CreatorOptions,
@@ -71,6 +72,25 @@ def _interval(value: str) -> ReportInterval:
 def _int_or_none(value: str) -> int | None:
     """Пустой select → None (сервис возьмёт значение из `.env`)."""
     return int(value) if value.strip() else None
+
+
+def _positive_int(value: str) -> int | None:
+    """ID из query-строки: мусор, пусто и неположительные — как «не выбран».
+
+    HTML-ручка принимает строку, а не `int`, специально: иначе FastAPI отвечает
+    JSON-422 на `?campaign_id=abc`, и вместо страницы с подсказкой пользователь
+    видит техническую ошибку.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _flag(value: str) -> bool:
+    """`?refresh=1|true|yes` включает режим; мусор считается «выключено»."""
+    return value.strip().lower() in {"1", "true", "yes"}
 
 
 def _with_default(
@@ -373,6 +393,15 @@ async def _editor_page(
         for offer in offers
         if offer.id not in used_offer_ids and offer.state in (None, "active")
     ]
+    # Потоки, куда вообще можно добавить оффер: в redirect-потоке офферов не
+    # бывает, поэтому в селекте его нет.
+    add_streams = (
+        [stream for stream in detail.streams if stream.schema_ != "redirect"]
+        if detail is not None
+        else []
+    )
+    # Предвыбор — непустой поток: пустой `default` отправил бы оффер «в никуда».
+    add_stream_id = suggested_offer_stream_id(add_streams)
     return _render(
         request,
         "editor.html",
@@ -387,6 +416,8 @@ async def _editor_page(
             "error": page_error,
             "notice": notice,
             "add_key": _key(),
+            "add_stream_id": add_stream_id,
+            "add_streams": add_streams,
             "delete_keys": delete_keys,
         },
         status_code=page_status,
@@ -402,23 +433,28 @@ async def editor_page(
     request: Request,
     session: SessionDep,
     client: KeitaroClientDep,
-    campaign_id: Annotated[int | None, Query(gt=0, description="ID кампании")] = None,
-    interval: Annotated[ReportInterval, Query(description="Диапазон цифр")] = DEFAULT_INTERVAL,
-    refresh: Annotated[int, Query(ge=0, le=1, description="1 — обновить кэш")] = 0,
-    created: Annotated[int, Query(ge=0, le=1, description="Показать «кампания создана»")] = 0,
+    campaign_id: Annotated[str, Query(description="ID кампании")] = "",
+    interval: Annotated[str, Query(description="Диапазон цифр")] = DEFAULT_INTERVAL,
+    refresh: Annotated[str, Query(description="1 — обновить кэш")] = "0",
+    created: Annotated[str, Query(description="1 — показать «кампания создана»")] = "0",
     action: Annotated[str | None, Query(description="added/removed")] = None,
 ) -> HTMLResponse:
-    """Показывает кампанию, потоки, веса и цифры; действия — отдельными POST."""
+    """Показывает кампанию, потоки, веса и цифры; действия — отдельными POST.
+
+    Параметры принимаются строками и нормализуются здесь: мусор в query-строке
+    (`?interval=bogus`, `?campaign_id=abc`) не должен превращаться в JSON-422,
+    потому что это HTML-страница.
+    """
     notice = ACTION_NOTICES.get(action or "")
-    if created:
+    if _flag(created):
         notice = "Кампания создана. Кампания и два потока открыты в редакторе."
     return await _editor_page(
         request,
         session,
         client,
-        campaign_id=campaign_id,
-        interval=interval,
-        refresh=bool(refresh),
+        campaign_id=_positive_int(campaign_id),
+        interval=_interval(interval),
+        refresh=_flag(refresh),
         notice=notice,
     )
 
@@ -437,13 +473,32 @@ async def editor_add_offer(
     offer_id: Annotated[str, Form()] = "",
     idempotency_key: Annotated[str, Form()] = "",
     interval: Annotated[str, Form()] = DEFAULT_INTERVAL,
+    stream_id: Annotated[str, Form()] = "",
 ) -> HTMLResponse | RedirectResponse:
     """Добавляет оффер и возвращает в редактор с сообщением об успехе."""
     period = _interval(interval)
     try:
+        # Поток из формы: у кампании может быть несколько потоков с офферами,
+        # и добавление «куда-нибудь» попадало бы не туда. Пустое значение —
+        # старый вариант формы, тогда поток выберет сервис.
+        parsed_stream_id = int(stream_id) if stream_id.strip() else None
+        if parsed_stream_id is not None and parsed_stream_id <= 0:
+            raise ValueError(stream_id)
+    except ValueError:
+        return await _editor_page(
+            request,
+            session,
+            client,
+            campaign_id=campaign_id,
+            interval=period,
+            error="некорректный поток кампании — обновите страницу",
+            status_code=422,
+        )
+
+    try:
         # Проверяет и число, и `gt=0`: голый `int()` пропускает `0` и `-5`,
         # а модель отсекает их на входе и даёт понятный текст для страницы.
-        offer_request = AddOfferRequest(offer_id=int(offer_id))
+        offer_request = AddOfferRequest(offer_id=int(offer_id), stream_id=parsed_stream_id)
     except ValidationError:
         # `ValidationError` — наследник `ValueError`, поэтому ловим его первым:
         # иначе нечисловое и неположительное значения слились бы в один текст.

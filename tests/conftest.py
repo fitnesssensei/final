@@ -67,7 +67,7 @@ def _isolate_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def _reset_settings_cache() -> AsyncIterator[None]:
+def _reset_settings_cache() -> Iterator[None]:
     """Сбрасывает кэш `get_settings()` до и после теста.
 
     `get_settings` кэширован через `lru_cache`, а тесты меняют окружение:

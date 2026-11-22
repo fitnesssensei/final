@@ -36,10 +36,11 @@ class Settings(BaseSettings):
     keitaro_group_id: int = Field(gt=0)
     keitaro_source_id: int = Field(gt=0)
     keitaro_google_url: HttpUrl = HttpUrl("https://www.google.com")
-    # Таймауты под веб-ручку: 10 с вместо 30, иначе зависший Keitaro держит
-    # воркер до 90 с (30 с × 3 попытки + паузы). Для долгих вызовов (создание
-    # кампании) значение поднимается через .env.
-    keitaro_timeout: float = Field(default=10.0, gt=0, le=300)
+    # Таймаут одного запроса к Keitaro. 60 с — по факту живого прогона
+    # 19.11.2026: `POST /streams` на инстансе не ответил за 10 с, и создание
+    # кампании падало в 502 (ReadTimeout) с компенсацией. 10 с оставалось
+    # слишком мало для записи; чтение укладывается и в меньший срок.
+    keitaro_timeout: float = Field(default=60.0, gt=0, le=300)
     keitaro_retries: int = Field(default=1, ge=0, le=5)
 
     database_url: str = DEFAULT_DATABASE_URL

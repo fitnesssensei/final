@@ -16,7 +16,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from keitaro_wrapper.db.models import DictionaryCache, GeoMap
+from keitaro_wrapper.db.models import DictionaryCache
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +109,9 @@ async def _replace_directory_once(
             row.name = entry.name
             row.payload = entry.payload
 
-    # Удаляем пропавшие одним DELETE по external_id, а не по списку id:
-    # в SQLite лимит 999 параметров, и большой справочник упал бы на нём.
+    # Удаляем пропавшие одним DELETE по external_id. SQLite разворачивает
+    # `NOT IN (...)` в параметр на элемент, но справочники здесь небольшие
+    # (кампании, офферы, домены), а лимит SQLite 3.50 — 32766 параметров.
     stale_filter = DictionaryCache.kind == kind
     if seen:
         stale_filter = stale_filter & DictionaryCache.external_id.not_in(seen)
@@ -127,33 +128,3 @@ async def list_directory(session: AsyncSession, kind: str) -> list[DictionaryCac
         .order_by(DictionaryCache.name, DictionaryCache.external_id)
     )
     return list(rows)
-
-
-async def upsert_geo_mapping(session: AsyncSession, *, code: str, keitaro_country: str) -> GeoMap:
-    """Сохраняет соответствие ISO-2 → название страны в Keitaro.
-
-    Код нормализуется в верхний регистр: `mx` из UI и `MX` из фильтра потока —
-    одна и та же страна. Длина проверяется здесь, потому что SQLite не
-    ограничивает `VARCHAR(2)`.
-    """
-    normalized = code.strip().upper()
-    if len(normalized) != 2 or not normalized.isalpha():
-        raise ValueError(f"гео-код должен быть ISO-2 (две буквы), получено {code!r}")
-    country = keitaro_country.strip()
-    if not country:
-        raise ValueError("название страны в Keitaro не может быть пустым")
-
-    mapping = await session.get(GeoMap, normalized)
-    if mapping is None:
-        mapping = GeoMap(code=normalized, keitaro_country=country)
-        session.add(mapping)
-    else:
-        mapping.keitaro_country = country
-    await session.flush()
-    return mapping
-
-
-async def resolve_keitaro_country(session: AsyncSession, code: str) -> str | None:
-    """Возвращает название страны для фильтра потока или None, если пары нет."""
-    mapping = await session.get(GeoMap, code.strip().upper())
-    return mapping.keitaro_country if mapping is not None else None

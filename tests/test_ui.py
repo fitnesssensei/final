@@ -18,7 +18,7 @@ from stub_keitaro import (
 
 from keitaro_wrapper.db import OperationLog, OperationStatus, create_session_factory
 from keitaro_wrapper.db.directories import list_directory
-from keitaro_wrapper.keitaro import Campaign, Offer, Stream, StreamOffer
+from keitaro_wrapper.keitaro import Campaign, Offer, ReportRow, Stream, StreamOffer
 from keitaro_wrapper.main import create_app
 
 ENV = {
@@ -84,6 +84,15 @@ def delete_forms(html: str) -> list[dict[str, str]]:
     return forms
 
 
+ADD_FORM = re.compile(r'action="/ui/editor/\d+/offers"(?P<body>.*?)</form>', re.S)
+
+
+def add_form(html: str) -> str:
+    """Тело формы добавления оффера (селекты потоков и офферов, скрытые ключи)."""
+    match = ADD_FORM.search(html)
+    return match.group("body") if match else ""
+
+
 async def journal(db_engine: AsyncEngine) -> list[OperationLog]:
     factory = create_session_factory(db_engine)
     async with factory() as session:
@@ -142,13 +151,22 @@ async def test_creator_without_active_offers_disables_submit(
 async def test_second_creator_render_does_not_hit_keitaro(
     ui_client: httpx.AsyncClient, stub: StubKeitaro
 ) -> None:
-    await ui_client.get("/ui/creator")
+    """Второй рендер берёт справочники из кэша и всё равно рисует селекты.
+
+    Одного «Keitaro не вызывали» мало: тест должен падать, если справочники
+    вернут пустоту, поэтому проверяем и содержимое селектов.
+    """
+    first = await ui_client.get("/ui/creator")
     calls_after_first = list(stub.calls)
 
     response = await ui_client.get("/ui/creator")
 
     assert response.status_code == 200
     assert stub.calls == calls_after_first
+    html = response.text
+    assert html.count("<option") == first.text.count("<option")
+    for expected in ("example.com", "Campaigns", "Google", "Peru", "Second"):
+        assert expected in html
 
 
 async def test_creator_submit_creates_campaign_and_redirects(
@@ -285,6 +303,31 @@ def two_offer_stream() -> list[Stream]:
     ]
 
 
+def mixed_streams() -> list[Stream]:
+    """Пустой `default`-поток и `regular` с оффером: раньше форма предвыбирала default."""
+    return [
+        Stream(
+            id=1,
+            name="Default",
+            type="default",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=1,
+        ),
+        Stream(
+            id=3,
+            name="Geo offers",
+            type="regular",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=3,
+            offers=[StreamOffer(offer_id=OFFER_ID, share=100, state="active")],
+        ),
+    ]
+
+
 def shared_offer_streams() -> list[Stream]:
     """Один и тот же оффер в двух потоках: у каждого действия свой ключ."""
     offers = [
@@ -355,6 +398,37 @@ async def test_editor_missing_campaign_returns_404_page(
     assert "Кампаний пока нет" not in response.text
 
 
+async def test_editor_tolerates_bad_query_params(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Мусор в query-строке — HTML-страница, а не JSON-422 от FastAPI."""
+    for url in (
+        "/ui/editor?interval=bogus",
+        "/ui/editor?campaign_id=abc",
+        "/ui/editor?campaign_id=0",
+        "/ui/editor?refresh=x",
+        "/ui/editor?created=x",
+    ):
+        response = await ui_client.get(url)
+
+        assert response.status_code == 200, url
+        assert response.headers["content-type"].startswith("text/html"), url
+        assert "<select" in response.text, url
+
+
+async def test_editor_banner_explains_missing_campaign_id(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Баннер объясняет и «отчёт не ответил», и «строки без привязки к кампании»."""
+    stub.report_rows = [ReportRow(offer="Peru", clicks=5, conversions=1)]
+
+    response = await ui_client.get(f"/ui/editor?campaign_id={CAMPAIGN_ID}")
+
+    assert response.status_code == 200
+    assert "Цифры временно недоступны" in response.text
+    assert "без" in response.text and "привязки к кампании" in response.text
+
+
 async def test_editor_report_failure_shows_banner(
     ui_client: httpx.AsyncClient, stub: StubKeitaro
 ) -> None:
@@ -392,6 +466,151 @@ async def test_editor_adds_offer_and_redirects(
     assert page.status_code == 200
     assert "Оффер добавлен" in page.text
     assert "50%" in page.text
+
+
+async def test_editor_add_form_offers_stream_choice(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Форма добавления выбирает поток: по умолчанию — `default` кампании.
+
+    До фикса поток выбирал сервис, и на кампании с пустым `default`-потоком
+    оффер уходил не в тот поток, который пользователь видел на странице.
+    """
+    # Один оффер в двух потоках: второй оффер свободен и доступен в форме.
+    stub.streams = shared_offer_streams()
+    stub.streams[0].offers = [StreamOffer(offer_id=OFFER_ID, share=100, state="active")]
+    stub.streams[1].offers = [StreamOffer(offer_id=OFFER_ID, share=100, state="active")]
+
+    page = await ui_client.get(f"/ui/editor?campaign_id={CAMPAIGN_ID}")
+
+    assert page.status_code == 200
+    assert 'name="stream_id"' in page.text
+    # Предвыбран default-поток (id=2), а не первый по порядку (id=1).
+    assert re.search(r'<option value="2"\s+selected', page.text)
+    assert not re.search(r'<option value="1"\s+selected', page.text)
+
+
+async def test_editor_add_form_preselects_non_empty_stream(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Предвыбран поток, где реально лежат офферы, а не пустой `default`.
+
+    До фикса форма предвыбирала `default`-поток даже пустым, и «Добавить»
+    отправляло оффер в поток, которого пользователь не видел.
+    """
+    stub.streams = mixed_streams()
+
+    page = await ui_client.get(f"/ui/editor?campaign_id={CAMPAIGN_ID}")
+
+    body = add_form(page.text)
+    assert body, "форма добавления должна быть на странице"
+    assert re.search(r'<option value="3"\s+selected', body)
+    assert not re.search(r'<option value="1"\s+selected', body)
+
+
+async def test_editor_add_form_has_no_preselect_when_ambiguous(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Два непустых потока без `default`: выбор остаётся человеку."""
+    stub.streams = [
+        Stream(
+            id=1,
+            name="Offers A",
+            type="regular",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=1,
+            offers=[StreamOffer(offer_id=OFFER_ID, share=100, state="active")],
+        ),
+        Stream(
+            id=3,
+            name="Offers B",
+            type="regular",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=3,
+            offers=[StreamOffer(offer_id=SECOND_OFFER_ID, share=100, state="active")],
+        ),
+    ]
+    stub.offers[18815] = Offer(id=18815, name="Third", state="active")
+
+    page = await ui_client.get(f"/ui/editor?campaign_id={CAMPAIGN_ID}")
+
+    body = add_form(page.text)
+    assert "— выберите поток —" in body
+    assert not re.search(r'<option value="\d+"\s+selected', body)
+
+
+async def test_editor_add_form_lists_only_offer_streams(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Redirect-поток в селекте потоков не показывается: офферам там не место."""
+    page = await ui_client.get(f"/ui/editor?campaign_id={CAMPAIGN_ID}")
+
+    body = add_form(page.text)
+    assert 'value="2"' in body  # default/landings, куда оффер и добавляется
+    assert 'value="1"' not in body  # regular/redirect
+
+
+async def test_editor_adds_offer_to_selected_stream(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """POST с `stream_id` меняет именно этот поток, а не default."""
+    stub.streams = [
+        Stream(
+            id=1,
+            name="Geo offers",
+            type="regular",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=1,
+            offers=[StreamOffer(offer_id=OFFER_ID, share=100, state="active")],
+        ),
+        Stream(
+            id=2,
+            name="Offers",
+            type="default",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=2,
+        ),
+    ]
+
+    response = await ui_client.post(
+        f"/ui/editor/{CAMPAIGN_ID}/offers",
+        data={
+            "offer_id": str(SECOND_OFFER_ID),
+            "stream_id": "1",
+            "idempotency_key": "ui-add-stream",
+            "interval": "all_time",
+        },
+    )
+
+    assert response.status_code == 303
+    _, (stream_id, _payload) = next(call for call in stub.calls if call[0] == "update_stream")
+    assert stream_id == 1
+
+
+async def test_editor_add_with_bad_stream_returns_422(
+    ui_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """Испорченный `stream_id` — страница с подсказкой, без обращений к Keitaro."""
+    response = await ui_client.post(
+        f"/ui/editor/{CAMPAIGN_ID}/offers",
+        data={
+            "offer_id": str(SECOND_OFFER_ID),
+            "stream_id": "abc",
+            "idempotency_key": "ui-bad-stream",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "некорректный поток" in response.text
+    assert "update_stream" not in stub.names
 
 
 async def test_editor_duplicate_offer_returns_409_page(

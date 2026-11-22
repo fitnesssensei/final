@@ -367,6 +367,30 @@ async def test_build_report_posts_body_and_parses_rows(keitaro: KeitaroClient) -
 
 
 @respx.mock
+async def test_build_report_sends_filters_and_skips_none(keitaro: KeitaroClient) -> None:
+    """Фильтр по кампании уходит в API, `filters=None` — не уходит вовсе."""
+    route = respx.post(f"{API}/report/build").mock(
+        return_value=httpx.Response(200, json={"rows": [], "total": 0})
+    )
+    payload = ReportRequest(
+        dimensions=["campaign_id", "offer"],
+        measures=["clicks", "conversions"],
+        filters=[{"name": "campaign_id", "operator": "EQUALS", "expression": 42}],
+    )
+
+    await keitaro.build_report(payload)
+
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["filters"] == [{"name": "campaign_id", "operator": "EQUALS", "expression": 42}]
+
+    await keitaro.build_report(
+        ReportRequest(dimensions=["campaign_id", "offer"], measures=["clicks", "conversions"])
+    )
+
+    assert "filters" not in json.loads(route.calls.last.request.content)
+
+
+@respx.mock
 async def test_401_maps_to_auth_error(keitaro: KeitaroClient) -> None:
     respx.get(f"{API}/campaigns").mock(
         return_value=httpx.Response(401, json={"error": "Invalid API key"})

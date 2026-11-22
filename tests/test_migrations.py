@@ -37,7 +37,6 @@ def test_upgrade_creates_model_schema(tmp_path: Path) -> None:
             actual_columns = {column["name"] for column in inspector.get_columns(table.name)}
             assert actual_columns == set(table.columns.keys())
         assert inspector.get_pk_constraint("operation_log")["constrained_columns"] == ["id"]
-        assert inspector.get_pk_constraint("geo_map")["constrained_columns"] == ["code"]
     finally:
         engine.dispose()
 

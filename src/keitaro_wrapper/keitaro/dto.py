@@ -131,7 +131,7 @@ class TrafficSource(KeitaroModel):
 class ReportRow(KeitaroModel):
     """Строка отчёта: набор измерений зависит от `dimensions` в запросе.
 
-    Поэтому `extra="allow"`: при запросе `["campaign", "offer"]` в строке
+    Поэтому `extra="allow"`: при запросе `["campaign_id", "offer"]` в строке
     не будет `stream`, зато появятся другие измерения.
     """
 
@@ -140,7 +140,10 @@ class ReportRow(KeitaroModel):
     campaign: str | None = None
     campaign_id: int | None = None
     stream: str | None = None
+    stream_id: int | None = None
     offer: str | None = None
+    # `offer_id = 0` — клики, ушедшие не на оффер (проверено на инстансе)
+    offer_id: int | None = None
     clicks: int = 0
     conversions: int = 0
 
@@ -216,8 +219,11 @@ class StreamUpdate(BaseModel):
 class ReportRequest(BaseModel):
     """Тело `POST /report/build`.
 
-    Рабочие значения для инстанса: `dimensions=["campaign","stream","offer"]`,
-    `measures=["clicks","conversions"]`, `range={"interval": "all_time"}`.
+    Рабочие значения для инстанса: `measures=["clicks","conversions"]`,
+    `range={"interval": "all_time"}`, а из измерений проверены живьём
+    (21.11.2026) `campaign_id`, `stream_id`, `offer_id`, `campaign`,
+    `stream`, `offer`. Редактор просит id-измерения и дополнительно сужает
+    отчёт фильтром по кампании (docs/parsing-access.md, `FilterRequest`).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -225,3 +231,6 @@ class ReportRequest(BaseModel):
     dimensions: list[str]
     measures: list[str]
     range: dict[str, str] = Field(default_factory=lambda: {"interval": "all_time"})
+    # `filters` — список `FilterRequest` (name/operator/expression) из спецификации;
+    # `None` не отправляется в Keitaro (`exclude_none` в клиенте).
+    filters: list[dict[str, Any]] | None = None

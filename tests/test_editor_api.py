@@ -244,6 +244,62 @@ async def test_remove_offer_returns_rebalanced_weights(
     ]
 
 
+async def test_remove_offer_from_given_stream(
+    api_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    """`?stream_id=` адресует поток: из второго потока тот же оффер остаётся."""
+    offers = [
+        StreamOffer(offer_id=OFFER_ID, share=50, state="active"),
+        StreamOffer(offer_id=SECOND_OFFER_ID, share=50, state="active"),
+    ]
+    stub.streams = [
+        Stream(
+            id=1,
+            name="Geo",
+            type="regular",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=1,
+            offers=list(offers),
+        ),
+        Stream(
+            id=2,
+            name="Offers",
+            type="default",
+            campaign_id=CAMPAIGN_ID,
+            schema_="landings",
+            action_type="http",
+            position=2,
+            offers=list(offers),
+        ),
+    ]
+
+    response = await api_client.delete(
+        f"/api/campaigns/{CAMPAIGN_ID}/offers/{OFFER_ID}?stream_id=1",
+        headers={"Idempotency-Key": "api-remove-stream"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["stream_id"] == 1
+    remaining = {stream.id: [offer.offer_id for offer in stream.offers] for stream in stub.streams}
+    assert remaining[1] == [SECOND_OFFER_ID]
+    assert remaining[2] == [OFFER_ID, SECOND_OFFER_ID]
+
+
+async def test_remove_offer_with_zero_stream_returns_422(
+    api_client: httpx.AsyncClient, stub: StubKeitaro
+) -> None:
+    stub.streams = two_offer_stream()
+
+    response = await api_client.delete(
+        f"/api/campaigns/{CAMPAIGN_ID}/offers/{SECOND_OFFER_ID}?stream_id=0",
+    )
+
+    assert response.status_code == 422
+    assert "update_stream" not in stub.names
+
+
 async def test_remove_offer_replay(api_client: httpx.AsyncClient, stub: StubKeitaro) -> None:
     stub.streams = two_offer_stream()
     first = await api_client.delete(

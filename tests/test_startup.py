@@ -104,6 +104,25 @@ async def test_dependency_returns_client_from_app_state(monkeypatch: pytest.Monk
         assert get_keitaro_client(request) is app.state.keitaro
 
 
+async def test_lifespan_closes_client_when_engine_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Не создался движок — httpx-клиент всё равно закрыт (иначе пул течёт)."""
+    set_env(monkeypatch)
+
+    def boom(url: str) -> None:
+        raise RuntimeError("engine failed")
+
+    monkeypatch.setattr("keitaro_wrapper.main.create_engine", boom)
+    app = create_app()
+
+    with pytest.raises(RuntimeError, match="engine failed"):
+        async with lifespan(app):
+            pass
+
+    assert app.state.keitaro.is_closed
+
+
 async def test_lifespan_creates_database_engine(monkeypatch: pytest.MonkeyPatch) -> None:
     """Движок и фабрика сессий появляются на старте и работают."""
     set_env(monkeypatch, DATABASE_URL="sqlite+aiosqlite:///:memory:")

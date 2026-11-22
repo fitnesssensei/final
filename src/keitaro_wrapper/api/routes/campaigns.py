@@ -149,7 +149,13 @@ async def add_offer_endpoint(
     client: KeitaroClientDep,
     idempotency_key: IdempotencyKey = None,
 ) -> OfferMutationResult:
-    """Веса пересчитываются поровну: 2 оффера — 50/50, 3 — 34/33/33."""
+    """Веса пересчитываются поровну: 2 оффера — 50/50, 3 — 34/33/33.
+
+    `stream_id` в теле адресует поток: у кампании может быть несколько потоков
+    с офферами, и добавление в «первый попавшийся» попадало бы не туда. Без
+    `stream_id` работает правило сервиса: `default`-поток, иначе единственный
+    поток с офферами.
+    """
     result = await add_offer(
         session,
         client,
@@ -181,14 +187,22 @@ async def remove_offer_endpoint(
     session: SessionDep,
     client: KeitaroClientDep,
     idempotency_key: IdempotencyKey = None,
+    stream_id: Annotated[
+        int | None, Query(gt=0, description="Поток кампании; без него поток выбирается правилом")
+    ] = None,
 ) -> OfferMutationResult:
-    """Повтор с тем же ключом вернёт сохранённый результат и не тронет Keitaro."""
+    """Повтор с тем же ключом вернёт сохранённый результат и не тронет Keitaro.
+
+    `stream_id` адресует поток: один оффер может стоять в нескольких потоках,
+    и удаление из конкретного — отдельная операция (входит в тело операции).
+    """
     result = await remove_offer(
         session,
         client,
         campaign_id,
         offer_id,
         idempotency_key=idempotency_key,
+        stream_id=stream_id,
     )
     if result.replayed:
         response.status_code = status.HTTP_200_OK

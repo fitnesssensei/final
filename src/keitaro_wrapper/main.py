@@ -45,7 +45,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.keitaro = client
     # Движок ленивый: соединение с БД откроется на первом запросе к журналу,
     # поэтому `/health` и чтение Keitaro работают и без поднятого Postgres.
-    engine = create_engine(settings.database_url)
+    # Если движок не создался (кривой DATABASE_URL), клиент закрываем здесь же:
+    # иначе httpx-пул провисит до выхода процесса.
+    try:
+        engine = create_engine(settings.database_url)
+    except Exception:
+        await client.aclose()
+        raise
     app.state.engine = engine
     app.state.session_factory = create_session_factory(engine)
     logger.info(

@@ -70,8 +70,9 @@
 
   {% if not detail.stats_available %}
     <div class="alert alert-warn" role="status">
-      Цифры временно недоступны: отчёт Keitaro не ответил. Потоки и офферы можно
-      редактировать, веса пересчитаются как обычно.
+      Цифры временно недоступны: отчёт Keitaro не ответил или вернул строки без
+      привязки к кампании. Потоки и офферы можно редактировать, веса
+      пересчитаются как обычно.
     </div>
   {% endif %}
   {% for stream in detail.streams %}
@@ -133,10 +134,22 @@
 
   <section class="card">
     <h2>Добавить оффер</h2>
-    {% if available_offers %}
+    {% if available_offers and add_streams %}
       <form class="inline" method="post" action="/ui/editor/{{ detail.campaign_id }}/offers" style="margin-top:12px">
         <input type="hidden" name="idempotency_key" value="{{ add_key }}">
         <input type="hidden" name="interval" value="{{ interval }}">
+        <label>Поток
+          <select name="stream_id" required>
+            {% if not add_stream_id %}
+              <option value="" selected disabled>— выберите поток —</option>
+            {% endif %}
+            {% for stream in add_streams %}
+              <option value="{{ stream.id }}" {% if stream.id == add_stream_id %}selected{% endif %}>
+                {{ stream.name }} ({{ stream.type }})
+              </option>
+            {% endfor %}
+          </select>
+        </label>
         <select name="offer_id" required>
           {% for offer in available_offers %}
             <option value="{{ offer.id }}" {% if offer.state not in (none, 'active') %}disabled{% endif %}>
@@ -147,7 +160,13 @@
         <button class="btn btn-primary" type="submit">Добавить</button>
       </form>
       <p class="hint" style="margin-top:10px">
-        После добавления веса всех офферов потока пересчитываются поровну и в сумме дают 100%.
+        Оффер добавляется в выбранный поток: после добавления веса всех офферов
+        этого потока пересчитываются поровну и в сумме дают 100%.
+      </p>
+    {% elif not add_streams %}
+      <p class="muted" style="margin-top:10px">
+        В кампании нет потока, куда можно добавить оффер: нужен поток со схемой
+        <code>landings</code> (в текущих потоках офферы не поддерживаются).
       </p>
     {% else %}
       <p class="muted" style="margin-top:10px">

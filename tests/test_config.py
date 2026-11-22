@@ -81,10 +81,10 @@ def test_default_google_url_and_database_url() -> None:
 
 
 def test_default_timeout_and_retries() -> None:
-    """Дефолты рассчитаны на веб-ручку: 10 с и один ретрай, а не 30 с × 3."""
+    """Дефолт таймаута — 60 с: на живом инстансе `POST /streams` не укладывался в 10."""
     settings = make_settings()
 
-    assert settings.keitaro_timeout == 10.0
+    assert settings.keitaro_timeout == 60.0
     assert settings.keitaro_retries == 1
 
 

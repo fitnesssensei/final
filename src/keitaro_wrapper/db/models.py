@@ -98,19 +98,3 @@ class DictionaryCache(Base):
     refreshed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
-
-
-class GeoMap(Base):
-    """Соответствие ISO-2 (для фильтра потока) названию страны в Keitaro.
-
-    Живой инстанс отдаёт `Offer.country = ['Peru']`, а фильтр потока ждёт `MX`,
-    поэтому оба представления хранятся рядом.
-    """
-
-    __tablename__ = "geo_map"
-
-    code: Mapped[str] = mapped_column(String(2), primary_key=True)
-    keitaro_country: Mapped[str] = mapped_column(String(64), unique=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )

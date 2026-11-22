@@ -113,7 +113,68 @@ async def test_detail_passes_interval_to_report(session: AsyncSession, stub: Stu
 
     report_call = next(payload for name, payload in stub.calls if name == "build_report")
     assert report_call.range == {"interval": "7_days_ago"}
-    assert report_call.dimensions == ["campaign_id", "offer"]
+    # id-измерения: цифры привязываются к потоку и офферу, а не к именам
+    assert report_call.dimensions == ["campaign_id", "stream_id", "offer_id"]
+    # Отчёт сужается фильтром по кампании: фильтр проверен живой пробой 21.11.2026
+    assert report_call.filters == [
+        {"name": "campaign_id", "operator": "EQUALS", "expression": CAMPAIGN_ID}
+    ]
+
+
+async def test_detail_numbers_are_split_by_stream(session: AsyncSession, stub: StubKeitaro) -> None:
+    """Один оффер в двух потоках: цифры каждого потока — свои."""
+    stub.streams = [
+        stream_with([(OFFER_ID, 100)], stream_id=1, stream_type="regular"),
+        stream_with([(OFFER_ID, 100)], stream_id=2),
+    ]
+    stub.report_rows = [
+        ReportRow(campaign_id=CAMPAIGN_ID, stream_id=1, offer_id=OFFER_ID, clicks=7, conversions=1),
+        ReportRow(campaign_id=CAMPAIGN_ID, stream_id=2, offer_id=OFFER_ID, clicks=3, conversions=0),
+    ]
+
+    detail = await get_campaign_detail(session, stub, CAMPAIGN_ID)
+
+    assert [stream.offers[0].clicks for stream in detail.streams] == [7, 3]
+    assert [stream.offers[0].conversions for stream in detail.streams] == [1, 0]
+    assert (detail.clicks, detail.conversions) == (10, 1)
+
+
+async def test_detail_does_not_merge_same_named_offers(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Одинаковые имена офферов не складываются: цифры считаются по `offer_id`."""
+    stub.offers[18815] = Offer(id=18815, name="Peru", state="active")
+    stub.streams = [stream_with([(OFFER_ID, 50), (18815, 50)])]
+    stub.report_rows = [
+        ReportRow(campaign_id=CAMPAIGN_ID, stream_id=2, offer_id=OFFER_ID, clicks=4, conversions=0),
+        ReportRow(campaign_id=CAMPAIGN_ID, stream_id=2, offer_id=18815, clicks=9, conversions=1),
+    ]
+
+    detail = await get_campaign_detail(session, stub, CAMPAIGN_ID)
+
+    clicks = {offer.offer_id: offer.clicks for offer in detail.streams[0].offers}
+    assert clicks == {OFFER_ID: 4, 18815: 9}
+    assert (detail.clicks, detail.conversions) == (13, 1)
+
+
+async def test_detail_hides_numbers_when_report_has_no_campaign_id(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Строки без `campaign_id` — не нули, а честный «цифры недоступны».
+
+    До фикса такие строки просто не проходили фильтр по id, и редактор
+    показывал `0` кликов при `stats_available=True`, то есть молча врал.
+    """
+    stub.report_rows = [
+        ReportRow(offer=None, clicks=10, conversions=1),
+        ReportRow(offer="Peru", clicks=5, conversions=2),
+    ]
+
+    detail = await get_campaign_detail(session, stub, CAMPAIGN_ID)
+
+    assert detail.stats_available is False
+    assert (detail.clicks, detail.conversions) == (0, 0)
+    assert detail.streams[1].offers[0].clicks == 0
 
 
 async def test_detail_does_not_merge_same_named_campaigns(
@@ -121,8 +182,8 @@ async def test_detail_does_not_merge_same_named_campaigns(
 ) -> None:
     """Отчёт фильтруется по campaign_id: одинаковые имена не складывают цифры."""
     stub.report_rows = [
-        ReportRow(campaign_id=CAMPAIGN_ID, offer="Peru", clicks=1, conversions=0),
-        ReportRow(campaign_id=999, offer="Peru", clicks=100, conversions=50),
+        ReportRow(campaign_id=CAMPAIGN_ID, stream_id=2, offer_id=OFFER_ID, clicks=1, conversions=0),
+        ReportRow(campaign_id=999, stream_id=2, offer_id=OFFER_ID, clicks=100, conversions=50),
     ]
 
     detail = await get_campaign_detail(session, stub, CAMPAIGN_ID)
@@ -250,6 +311,162 @@ async def test_add_third_offer_gives_34_33_33(session: AsyncSession, stub: StubK
 
     assert [offer.share for offer in result.offers] == [34, 33, 33]
     assert sum(offer.share for offer in result.offers) == 100
+
+
+async def test_add_offer_targets_given_stream(session: AsyncSession, stub: StubKeitaro) -> None:
+    """Оффер добавляется в выбранный поток, а не «куда-нибудь».
+
+    До фикса добавление адресовалось кампании: при пустом `default`-потоке оффер
+    уходил в него (пользователь видел результат в другом потоке), а при двух
+    потоках с офферами добавление вообще отказывало с 422.
+    """
+    stub.streams = [
+        stream_with([], stream_id=2),
+        stream_with([(OFFER_ID, 100)], stream_id=3, stream_type="regular"),
+    ]
+
+    result = await add_offer(
+        session, stub, CAMPAIGN_ID, AddOfferRequest(offer_id=SECOND_OFFER_ID, stream_id=3)
+    )
+
+    assert result.stream_id == 3
+    assert [(offer.offer_id, offer.share) for offer in result.offers] == [
+        (OFFER_ID, 50),
+        (SECOND_OFFER_ID, 50),
+    ]
+    remaining = {stream.id: [offer.offer_id for offer in stream.offers] for stream in stub.streams}
+    # Пустой default-поток не тронут: оффер попал туда, куда просили.
+    assert remaining[2] == []
+    assert remaining[3] == [OFFER_ID, SECOND_OFFER_ID]
+
+
+async def test_add_offer_without_stream_is_ambiguous(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Без `stream_id` при двух потоках с офферами API просит выбрать поток."""
+    stub.streams = [
+        stream_with([(OFFER_ID, 100)], stream_id=1, stream_type="regular"),
+        stream_with([(SECOND_OFFER_ID, 100)], stream_id=2, stream_type="regular"),
+    ]
+
+    with pytest.raises(RequestError, match="выберите поток"):
+        await add_offer(session, stub, CAMPAIGN_ID, AddOfferRequest(offer_id=OFFER_ID))
+
+    assert "update_stream" not in stub.names
+
+
+async def test_add_offer_with_unknown_stream_returns_404(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Поток могли удалить в Keitaro: 404 с объяснением, без PUT."""
+    stub.streams = [stream_with([(OFFER_ID, 100)])]
+
+    with pytest.raises(NotFound, match="нет потока"):
+        await add_offer(
+            session, stub, CAMPAIGN_ID, AddOfferRequest(offer_id=SECOND_OFFER_ID, stream_id=999)
+        )
+
+    assert "update_stream" not in stub.names
+
+
+async def test_add_same_key_for_two_streams_conflicts(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Тело операции содержит `stream_id`: другой поток с тем же ключом — 409."""
+    stub.streams = [
+        stream_with([(OFFER_ID, 100)], stream_id=1, stream_type="regular"),
+        stream_with([(OFFER_ID, 100)], stream_id=2),
+    ]
+    await add_offer(
+        session,
+        stub,
+        CAMPAIGN_ID,
+        AddOfferRequest(offer_id=SECOND_OFFER_ID, stream_id=1),
+        idempotency_key="add-two",
+    )
+
+    with pytest.raises(Conflict, match="другим телом"):
+        await add_offer(
+            session,
+            stub,
+            CAMPAIGN_ID,
+            AddOfferRequest(offer_id=SECOND_OFFER_ID, stream_id=2),
+            idempotency_key="add-two",
+        )
+
+
+async def test_add_offer_without_stream_prefers_stream_with_offers(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Без `stream_id` оффер идёт туда, где уже лежат офферы, а не в пустой default.
+
+    До фикса `default`-поток был первым в приоритете даже пустым, и добавление
+    через API уходило в поток, которого пользователь не видел.
+    """
+    stub.streams = [
+        stream_with([], stream_id=1),
+        stream_with([(OFFER_ID, 100)], stream_id=3, stream_type="regular"),
+    ]
+
+    result = await add_offer(session, stub, CAMPAIGN_ID, AddOfferRequest(offer_id=SECOND_OFFER_ID))
+
+    assert result.stream_id == 3
+    remaining = {stream.id: [offer.offer_id for offer in stream.offers] for stream in stub.streams}
+    assert remaining[1] == []
+    assert remaining[3] == [OFFER_ID, SECOND_OFFER_ID]
+
+
+async def test_add_offer_legacy_payload_replays(session: AsyncSession, stub: StubKeitaro) -> None:
+    """Тело операции без `stream_id` должно повторяться, а не давать 409.
+
+    Пока поток не задан, поля `stream_id` в payload быть не должно: иначе записи
+    журнала, сделанные до появления этого поля, перестают совпадать по телу и
+    повтор превращается в 409 «другим телом запроса» вместо `replayed: true`.
+    """
+    first = await add_offer(
+        session,
+        stub,
+        CAMPAIGN_ID,
+        AddOfferRequest(offer_id=SECOND_OFFER_ID),
+        idempotency_key="legacy-add",
+    )
+    stored = await find_operation(session, "legacy-add")
+    assert stored is not None
+    assert stored.payload == {"campaign_id": CAMPAIGN_ID, "offer_id": SECOND_OFFER_ID}
+
+    calls_before = list(stub.calls)
+    second = await add_offer(
+        session,
+        stub,
+        CAMPAIGN_ID,
+        AddOfferRequest(offer_id=SECOND_OFFER_ID),
+        idempotency_key="legacy-add",
+    )
+
+    assert second.replayed is True
+    assert second.offers == first.offers
+    assert stub.calls == calls_before
+
+
+async def test_add_offer_with_stream_keeps_it_in_payload(
+    session: AsyncSession, stub: StubKeitaro
+) -> None:
+    """Если поток задан — он в payload: повтор с другим потоком это другая операция."""
+    await add_offer(
+        session,
+        stub,
+        CAMPAIGN_ID,
+        AddOfferRequest(offer_id=SECOND_OFFER_ID, stream_id=2),
+        idempotency_key="add-with-stream",
+    )
+
+    stored = await find_operation(session, "add-with-stream")
+    assert stored is not None
+    assert stored.payload == {
+        "campaign_id": CAMPAIGN_ID,
+        "offer_id": SECOND_OFFER_ID,
+        "stream_id": 2,
+    }
 
 
 async def test_add_existing_offer_conflicts(session: AsyncSession, stub: StubKeitaro) -> None:
